@@ -1088,30 +1088,35 @@ async function handleTanya(ctx) {
 // ─── COACHING HELPER ─────────────────────────────────────────
 
 /**
- * Generate dan kirim coaching insight sebagai pesan terpisah
- * Dipanggil secara fire-and-forget (gak di-await) biar gak delay response utama
- *
- * @param {object} ctx - Telegraf context
- * @param {number} tgId
- * @param {object} user
- * @param {object} todaySummary
- * @param {object} lastFood - makanan yang baru di-log
+ * Generate dan kirim coaching + food recommendation setelah log makan
+ * Dipanggil secara fire-and-forget biar gak delay response utama
+ * Coaching & recommendation di-generate paralel → lebih cepat
  */
 async function generateAndSendCoaching(ctx, tgId, user, todaySummary, lastFood) {
     try {
-        const coaching = await gemini.generateDailyCoaching(user, todaySummary, lastFood);
+        // Generate coaching + recommendation secara paralel (lebih cepat)
+        const [coaching, recommendation] = await Promise.all([
+            gemini.generateDailyCoaching(user, todaySummary, lastFood),
+            gemini.generateFoodRecommendation(user, todaySummary, lastFood)
+        ]);
 
-        // Kalau Gemini gagal generate, skip aja — jangan ganggu user
-        if (!coaching) return;
+        // Kirim coaching dulu kalau ada
+        if (coaching) {
+            await ctx.telegram.sendMessage(tgId,
+                `💬 *Coach says:*\n\n${coaching}`,
+                { parse_mode: 'Markdown' }
+            );
+        }
 
-        // Kirim sebagai pesan baru dengan styling coach
-        await ctx.telegram.sendMessage(tgId,
-            `💬 *Coach says:*\n\n${coaching}`,
-            { parse_mode: 'Markdown' }
-        );
+        // Kirim food recommendation sebagai pesan terpisah
+        if (recommendation) {
+            await ctx.telegram.sendMessage(tgId,
+                recommendation,
+                { parse_mode: 'Markdown' }
+            );
+        }
 
     } catch (err) {
-        // Coaching gagal → diem aja, jangan ganggu user experience
         console.error('[Coaching] Failed to send:', err.message);
     }
 }
