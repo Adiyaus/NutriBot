@@ -11,6 +11,33 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_KEY
 );
 
+// ─── TIMEZONE HELPER ──────────────────────────────────────────
+
+/**
+ * Ambil tanggal hari ini dalam timezone WIB (UTC+7)
+ * Format: 'YYYY-MM-DD'
+ *
+ * Kenapa perlu ini:
+ * new Date().toISOString() selalu return UTC — jadi sebelum jam 07:00 WIB,
+ * UTC masih "kemarin" → data hari sebelumnya kebaca sebagai "hari ini"
+ *
+ * Fix: offset manual +7 jam sebelum format ke string
+ */
+function getTodayWIB() {
+    const now       = new Date();
+    const wibOffset = 7 * 60 * 60 * 1000;          // 7 jam dalam milliseconds
+    const wibDate   = new Date(now.getTime() + wibOffset); // geser ke WIB
+    return wibDate.toISOString().split('T')[0];     // ambil bagian YYYY-MM-DD
+}
+
+/**
+ * Buat objek Date yang sudah di-offset ke WIB
+ * Dipake buat kalkulasi tanggal (streak, weekly logs)
+ */
+function nowWIB() {
+    return new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
+}
+
 // ─── USER QUERIES ─────────────────────────────────────────────
 
 async function getUser(telegramId) {
@@ -65,15 +92,17 @@ async function getStreak(telegramId) {
 
     const uniqueDates = [...new Set(data.map(r => r.log_date))];
     let streak    = 0;
-    const today   = new Date();
-    today.setHours(0, 0, 0, 0);
-    let checkDate = new Date(today);
+
+    // Pakai nowWIB() biar streak ngitung berdasarkan hari WIB, bukan UTC
+    let checkDate = nowWIB();
+    checkDate.setUTCHours(0, 0, 0, 0); // reset ke awal hari WIB
 
     for (let i = 0; i < uniqueDates.length; i++) {
+        // Format tanggal dalam WIB — ambil YYYY-MM-DD dari ISO string
         const dateStr = checkDate.toISOString().split('T')[0];
         if (uniqueDates.includes(dateStr)) {
             streak++;
-            checkDate.setDate(checkDate.getDate() - 1);
+            checkDate.setDate(checkDate.getDate() - 1); // mundur 1 hari
         } else {
             break;
         }
@@ -122,7 +151,7 @@ async function insertFoodLog(telegramId, nutritionData) {
         .from('food_logs')
         .insert({
             telegram_id: telegramId,
-            log_date: new Date().toISOString().split('T')[0],
+            log_date: getTodayWIB(),
             ...nutritionData,
             logged_at: new Date().toISOString()
         })
@@ -146,7 +175,7 @@ async function updateFoodLogDescription(logId, newDescription) {
 }
 
 async function deleteTodayLogs(telegramId) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayWIB();
     const { data, error } = await supabase
         .from('food_logs')
         .delete()
@@ -159,7 +188,7 @@ async function deleteTodayLogs(telegramId) {
 }
 
 async function getDailySummary(telegramId) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayWIB();
     const { data, error } = await supabase
         .from('daily_summary')
         .select('*')
@@ -183,7 +212,7 @@ async function getDailySummary(telegramId) {
  * @returns {Array} list { food_description, calories, logged_at }
  */
 async function getTodayFoodList(telegramId) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayWIB();
 
     const { data, error } = await supabase
         .from('food_logs')
@@ -200,7 +229,8 @@ async function getTodayFoodList(telegramId) {
 }
 
 async function getWeeklyLogs(telegramId) {
-    const sevenDaysAgo = new Date();
+    // Pakai nowWIB() biar 7 hari terakhir dihitung berdasarkan waktu WIB
+    const sevenDaysAgo = nowWIB();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
     const { data, error } = await supabase
