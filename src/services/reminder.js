@@ -10,7 +10,7 @@ const gemini = require('./gemini');
 function initReminder(bot) {
 
     // ── Daily reminder — cek setiap menit ────────────────────
-    cron.schedule('* * * * *', async () => {
+    cron.schedule('0 * * * *', async () => {
         try {
             const now        = new Date();
             const wibMinutes = (now.getUTCHours() * 60 + now.getUTCMinutes() + 7 * 60) % (24 * 60);
