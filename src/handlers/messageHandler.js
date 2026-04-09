@@ -57,6 +57,7 @@ async function handleHelp(ctx) {
         `*/remind [HH:MM]* — set reminder harian\n` +
         `*/menu* — lihat & pilih menu tersimpan\n` +
         `*/catat [makanan]* — log makanan tanpa foto\n` +
+        `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
         `*/profil* — lihat & update data profil\n` +
         `*/reset* — hapus semua log hari ini\n` +
         `*/adjust* — koreksi hasil analisis terakhir\n` +
@@ -1005,6 +1006,85 @@ async function handlePhoto(ctx) {
     }
 }
 
+// ─── NEW: TANYA COACH ─────────────────────────────────────────
+
+/**
+ * /tanya [pertanyaan] — tanya jawab personal dengan AI coach
+ *
+ * Contoh:
+ *   /tanya apakah nasi merah lebih bagus dari nasi putih buat diet?
+ *   /tanya olahraga apa yang cocok buat berat badan aku sekarang?
+ *   /tanya kenapa aku lapar terus padahal udah makan?
+ *   /tanya berapa gram protein yang aku butuhkan per hari?
+ */
+async function handleTanya(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! 😅 Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    // Ambil pertanyaan setelah "/tanya "
+    const fullText = ctx.message.text || '';
+    const question = fullText.replace(/^\/tanya\s*/i, '').trim();
+
+    // Kalau gak ada pertanyaan, kasih contoh
+    if (!question) {
+        await reply(ctx,
+            `🤔 *Tanya Apa ke Coach?*\n\n` +
+            `Format: \`/tanya [pertanyaan lo]\`\n\n` +
+            `*Contoh pertanyaan:*\n` +
+            `• \`/tanya olahraga apa yang cocok buat aku?\`\n` +
+            `• \`/tanya kenapa aku lapar terus?\`\n` +
+            `• \`/tanya berapa protein yang aku butuhkan?\`\n` +
+            `• \`/tanya boleh makan nasi malam hari ga?\`\n` +
+            `• \`/tanya cara atasi plateau diet gimana?\`\n\n` +
+            `_Coach bakal jawab berdasarkan data profil lo personally!_ 💪`
+        );
+        return;
+    }
+
+    if (question.length > 500) {
+        await reply(ctx, `Pertanyaannya terlalu panjang. Maksimal 500 karakter ya!`);
+        return;
+    }
+
+    // Loading message
+    const loadingMsg = await reply(ctx,
+        `🤔 *Coach lagi mikir...*\n_Menyesuaikan jawaban dengan profil lo..._`
+    );
+
+    try {
+        // Ambil progress hari ini buat konteks jawaban yang lebih relevan
+        const todaySummary = await db.getDailySummary(tgId);
+
+        // Generate jawaban personal dari Gemini
+        const answer = await gemini.generateCoachAnswer(user, todaySummary, question);
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, null,
+            `💬 *Coach NutriBot:*\n\n` +
+            `_"${question}"_\n\n` +
+            `━━━━━━━━━━━━━━\n\n` +
+            `${answer}\n\n` +
+            `_Mau tanya lagi? /tanya [pertanyaan]_ 😊`,
+            { parse_mode: 'Markdown' }
+        );
+
+    } catch (err) {
+        console.error(`[TanyaHandler] Error for ${tgId}:`, err.message);
+
+        const errMsg = err.message === 'RATE_LIMIT'
+            ? `⏳ Coach lagi sibuk. Tunggu ~1 menit terus coba lagi ya!`
+            : `😵 Ada error. Coba tanya lagi!`;
+
+        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
+            .catch(() => reply(ctx, errMsg));
+    }
+}
+
 // ─── COACHING HELPER ─────────────────────────────────────────
 
 /**
@@ -1097,6 +1177,6 @@ module.exports = {
     handleStart, handleHelp, handleStatus, handleLaporan,
     handleProfil, handleReset, handleAdjust,
     handleStreak, handleTarget, handleRemind,
-    handleMenu, handleCatat,
+    handleMenu, handleCatat, handleTanya,
     handleText, handleCallbackQuery, handlePhoto
 };

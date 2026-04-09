@@ -297,10 +297,81 @@ function getTimeOfDay() {
     return 'malam';
 }
 
+/**
+ * Jawab pertanyaan user seputar diet, nutrisi, olahraga
+ * Dipersonalisasi berdasarkan data profil user
+ *
+ * @param {object} user - profil user dari DB
+ * @param {object} todaySummary - progress kalori hari ini
+ * @param {string} question - pertanyaan dari user
+ * @returns {string} jawaban dari coach
+ */
+async function generateCoachAnswer(user, todaySummary, question) {
+    const consumed  = Math.round(todaySummary?.total_calories || 0);
+    const remaining = Math.round((user.daily_calorie_goal || 0) - consumed);
+
+    // Hitung BMI realtime dari data user
+    const heightM = user.height_cm / 100;
+    const bmi     = (user.weight_kg / (heightM * heightM)).toFixed(1);
+
+    const prompt = `
+Kamu adalah coach diet & nutrisi profesional bernama Coach NutriBot. 
+Lo friendly, evidence-based, dan gaya bahasa lo campuran Indonesia-Inggris (Jaksel style).
+Jawaban lo harus PERSONAL — selalu kaitkan dengan kondisi spesifik user ini.
+
+DATA LENGKAP USER:
+- Nama: ${user.name}
+- Umur: ${user.age} tahun
+- Gender: ${user.gender}
+- Tinggi: ${user.height_cm} cm
+- Berat: ${user.weight_kg} kg
+- BMI: ${bmi}
+- Level aktivitas: ${user.activity_level}
+- BMR: ${Math.round(user.bmr)} kkal/hari
+- TDEE: ${Math.round(user.tdee)} kkal/hari
+- Target kalori: ${Math.round(user.daily_calorie_goal)} kkal/hari
+- Target berat: ${user.target_weight ? user.target_weight + ' kg' : 'belum diset'}
+
+PROGRESS HARI INI:
+- Kalori terpakai: ${consumed} kkal
+- Sisa kalori: ${remaining} kkal
+- Sudah makan: ${todaySummary?.meal_count || 0}x
+
+PERTANYAAN USER:
+"${question}"
+
+ATURAN JAWABAN:
+- Jawab langsung, to-the-point, max 5-7 kalimat
+- Selalu personalisasi dengan data user di atas — jangan jawab generik
+- Kalau pertanyaan soal olahraga, sesuaikan dengan berat badan & level aktivitas user
+- Kalau pertanyaan soal makanan/nutrisi, kaitkan dengan target kalori user
+- Kalau pertanyaan di luar topik diet/nutrisi/olahraga/kesehatan, tolak dengan sopan
+- Boleh kasih 1-2 saran konkret yang actionable
+- Gunakan angka spesifik dari data user kalau relevan
+
+Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
+    `.trim();
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [{ role: 'user', parts: [{ text: prompt }] }]
+        });
+
+        return response.text.trim();
+
+    } catch (err) {
+        console.error('[Gemini] CoachAnswer error:', err.message);
+        if (err.status === 429 || err.message?.includes('429')) throw new Error('RATE_LIMIT');
+        throw new Error('GEMINI_ERROR');
+    }
+}
+
 module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
     generateDailyCoaching,
     generateWeeklyCoaching,
+    generateCoachAnswer,
     downloadImage
 };

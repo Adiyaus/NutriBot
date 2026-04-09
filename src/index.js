@@ -7,7 +7,7 @@ const {
     handleStart, handleHelp, handleStatus, handleLaporan,
     handleProfil, handleReset, handleAdjust,
     handleStreak, handleTarget, handleRemind,
-    handleMenu, handleCatat,
+    handleMenu, handleCatat, handleTanya,
     handleText, handleCallbackQuery, handlePhoto
 } = require('./handlers/messageHandler');
 
@@ -26,6 +26,7 @@ bot.command('target',  handleTarget);
 bot.command('remind',  handleRemind);
 bot.command('menu',    handleMenu);
 bot.command('catat',   handleCatat);
+bot.command('tanya',   handleTanya);
 
 bot.on('photo',          handlePhoto);
 bot.on('callback_query', handleCallbackQuery);
