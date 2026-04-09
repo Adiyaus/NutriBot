@@ -1,7 +1,6 @@
 // ============================================================
 // src/services/database.js
-// Update: tambah getStreak, setTargetWeight, setReminderTime,
-//         getUsersWithReminder
+// Update: tambah saved_menus queries
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -53,18 +52,9 @@ async function updateRegistrationStep(telegramId, step) {
     if (error) console.error('[DB] updateStep error:', error.message);
 }
 
-// ─── STREAK QUERIES ───────────────────────────────────────────
+// ─── STREAK ───────────────────────────────────────────────────
 
-/**
- * Hitung streak harian user — berapa hari berturut-turut ada log makanan
- * Logic: mulai dari kemarin, hitung mundur selama masih ada data
- * (Hari ini tidak dihitung karena mungkin belum selesai)
- *
- * @param {number} telegramId
- * @returns {number} jumlah hari streak
- */
 async function getStreak(telegramId) {
-    // Ambil semua tanggal unik yang ada log-nya, urut dari terbaru
     const { data, error } = await supabase
         .from('food_logs')
         .select('log_date')
@@ -73,81 +63,50 @@ async function getStreak(telegramId) {
 
     if (error || !data || data.length === 0) return 0;
 
-    // Ambil tanggal unik saja (bisa ada banyak log per hari)
     const uniqueDates = [...new Set(data.map(r => r.log_date))];
-
-    let streak     = 0;
-    const today    = new Date();
+    let streak    = 0;
+    const today   = new Date();
     today.setHours(0, 0, 0, 0);
-
-    // Mulai cek dari hari ini mundur
-    // Kalau hari ini udah ada log, hitung. Kalau belum, mulai dari kemarin
     let checkDate = new Date(today);
 
     for (let i = 0; i < uniqueDates.length; i++) {
-        const dateStr = checkDate.toISOString().split('T')[0]; // format YYYY-MM-DD
-
+        const dateStr = checkDate.toISOString().split('T')[0];
         if (uniqueDates.includes(dateStr)) {
-            streak++;                                  // ada log di hari ini → tambah streak
-            checkDate.setDate(checkDate.getDate() - 1); // mundur 1 hari
+            streak++;
+            checkDate.setDate(checkDate.getDate() - 1);
         } else {
-            break; // gak ada log di hari itu → streak putus, stop
+            break;
         }
     }
-
     return streak;
 }
 
-// ─── TARGET WEIGHT ────────────────────────────────────────────
+// ─── TARGET & REMINDER ────────────────────────────────────────
 
-/**
- * Set target berat badan user
- * @param {number} telegramId
- * @param {number} targetWeight - target berat dalam kg
- */
 async function setTargetWeight(telegramId, targetWeight) {
     const { error } = await supabase
         .from('users')
         .update({ target_weight: targetWeight, updated_at: new Date().toISOString() })
         .eq('telegram_id', telegramId);
 
-    if (error) {
-        console.error('[DB] setTargetWeight error:', error.message);
-        throw new Error('Gagal set target berat');
-    }
+    if (error) throw new Error('Gagal set target berat');
 }
 
-// ─── REMINDER ─────────────────────────────────────────────────
-
-/**
- * Set waktu reminder harian user
- * @param {number} telegramId
- * @param {string|null} time - format 'HH:MM' atau null buat matiin reminder
- */
 async function setReminderTime(telegramId, time) {
     const { error } = await supabase
         .from('users')
         .update({ reminder_time: time, updated_at: new Date().toISOString() })
         .eq('telegram_id', telegramId);
 
-    if (error) {
-        console.error('[DB] setReminderTime error:', error.message);
-        throw new Error('Gagal set reminder');
-    }
+    if (error) throw new Error('Gagal set reminder');
 }
 
-/**
- * Ambil semua user yang punya reminder di jam tertentu
- * Dipanggil setiap menit oleh cron job
- * @param {string} time - format 'HH:MM'
- * @returns {Array} list user yang perlu diremind sekarang
- */
 async function getUsersWithReminder(time) {
     const { data, error } = await supabase
         .from('users')
         .select('telegram_id, name, daily_calorie_goal, reminder_time')
-        .eq('reminder_time', time)       // filter by jam reminder
-        .eq('is_registered', true);      // hanya user yang sudah terdaftar
+        .eq('reminder_time', time)
+        .eq('is_registered', true);
 
     if (error) {
         console.error('[DB] getUsersWithReminder error:', error.message);
@@ -183,15 +142,11 @@ async function updateFoodLogDescription(logId, newDescription) {
         .update({ food_description: newDescription })
         .eq('id', logId);
 
-    if (error) {
-        console.error('[DB] updateFoodLog error:', error.message);
-        throw new Error('Gagal update food log');
-    }
+    if (error) throw new Error('Gagal update food log');
 }
 
 async function deleteTodayLogs(telegramId) {
     const today = new Date().toISOString().split('T')[0];
-
     const { data, error } = await supabase
         .from('food_logs')
         .delete()
@@ -199,16 +154,12 @@ async function deleteTodayLogs(telegramId) {
         .eq('log_date', today)
         .select();
 
-    if (error) {
-        console.error('[DB] deleteTodayLogs error:', error.message);
-        throw new Error('Gagal reset log hari ini');
-    }
+    if (error) throw new Error('Gagal reset log hari ini');
     return data?.length || 0;
 }
 
 async function getDailySummary(telegramId) {
     const today = new Date().toISOString().split('T')[0];
-
     const { data, error } = await supabase
         .from('daily_summary')
         .select('*')
@@ -219,7 +170,6 @@ async function getDailySummary(telegramId) {
     if (error && error.code !== 'PGRST116') {
         console.error('[DB] getDailySummary error:', error.message);
     }
-
     return data || {
         total_calories: 0, total_protein: 0,
         total_carbs: 0, total_fat: 0, meal_count: 0
@@ -237,24 +187,127 @@ async function getWeeklyLogs(telegramId) {
         .gte('log_date', sevenDaysAgo.toISOString().split('T')[0])
         .order('log_date', { ascending: true });
 
+    if (error) return [];
+    return data;
+}
+
+// ─── SAVED MENUS QUERIES ──────────────────────────────────────
+
+/**
+ * Simpan menu baru ke tabel saved_menus
+ * @param {number} telegramId
+ * @param {object} menuData - { menu_name, food_description, calories, protein_g, carbs_g, fat_g }
+ */
+async function saveMenu(telegramId, menuData) {
+    const { data, error } = await supabase
+        .from('saved_menus')
+        .insert({
+            telegram_id: telegramId,
+            ...menuData
+        })
+        .select()
+        .single();
+
     if (error) {
-        console.error('[DB] getWeeklyLogs error:', error.message);
-        return [];
+        console.error('[DB] saveMenu error:', error.message);
+        throw new Error('Gagal simpan menu');
     }
     return data;
 }
 
+/**
+ * Ambil semua menu tersimpan milik user
+ * Diurutkan berdasarkan use_count (paling sering dipake duluan)
+ * @param {number} telegramId
+ */
+async function getSavedMenus(telegramId) {
+    const { data, error } = await supabase
+        .from('saved_menus')
+        .select('*')
+        .eq('telegram_id', telegramId)
+        .order('use_count', { ascending: false }) // yang paling sering dipake muncul duluan
+        .order('created_at', { ascending: false }); // kalau use_count sama, yang terbaru duluan
+
+    if (error) {
+        console.error('[DB] getSavedMenus error:', error.message);
+        return [];
+    }
+    return data || [];
+}
+
+/**
+ * Ambil 1 menu by ID — dipake waktu user pilih menu dari list
+ * @param {number} menuId
+ * @param {number} telegramId - untuk validasi ownership
+ */
+async function getSavedMenuById(menuId, telegramId) {
+    const { data, error } = await supabase
+        .from('saved_menus')
+        .select('*')
+        .eq('id', menuId)
+        .eq('telegram_id', telegramId) // pastiin menu ini milik user yang beneran
+        .single();
+
+    if (error) {
+        console.error('[DB] getSavedMenuById error:', error.message);
+        return null;
+    }
+    return data;
+}
+
+/**
+ * Increment use_count setiap kali menu dipilih dari list
+ * Dipake buat sorting — yang sering dipake muncul paling atas
+ * @param {number} menuId
+ */
+async function incrementMenuUseCount(menuId) {
+    const { error } = await supabase
+        .rpc('increment_menu_use_count', { menu_id: menuId }); // pakai RPC buat atomic increment
+
+    // Fallback kalau RPC belum dibuat — pakai cara manual
+    if (error) {
+        const { data: menu } = await supabase
+            .from('saved_menus')
+            .select('use_count')
+            .eq('id', menuId)
+            .single();
+
+        if (menu) {
+            await supabase
+                .from('saved_menus')
+                .update({ use_count: (menu.use_count || 0) + 1 })
+                .eq('id', menuId);
+        }
+    }
+}
+
+/**
+ * Hapus menu tersimpan by ID
+ * @param {number} menuId
+ * @param {number} telegramId - validasi ownership
+ */
+async function deleteMenu(menuId, telegramId) {
+    const { error } = await supabase
+        .from('saved_menus')
+        .delete()
+        .eq('id', menuId)
+        .eq('telegram_id', telegramId); // hanya bisa hapus menu milik sendiri
+
+    if (error) {
+        console.error('[DB] deleteMenu error:', error.message);
+        throw new Error('Gagal hapus menu');
+    }
+}
+
 module.exports = {
-    getUser,
-    upsertUser,
-    updateRegistrationStep,
-    getStreak,
-    setTargetWeight,
-    setReminderTime,
-    getUsersWithReminder,
-    insertFoodLog,
-    updateFoodLogDescription,
-    deleteTodayLogs,
-    getDailySummary,
-    getWeeklyLogs
+    // user
+    getUser, upsertUser, updateRegistrationStep,
+    // streak, target, reminder
+    getStreak, setTargetWeight, setReminderTime, getUsersWithReminder,
+    // food logs
+    insertFoodLog, updateFoodLogDescription, deleteTodayLogs,
+    getDailySummary, getWeeklyLogs,
+    // saved menus
+    saveMenu, getSavedMenus, getSavedMenuById,
+    incrementMenuUseCount, deleteMenu
 };
