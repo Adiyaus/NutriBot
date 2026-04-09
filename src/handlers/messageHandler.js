@@ -1,18 +1,14 @@
 // ============================================================
 // src/handlers/messageHandler.js
-// Update: tambah /reset, /adjust, persistent user data
+// Update: tambah /streak, /target, /remind
 // ============================================================
 
 const db     = require('../services/database');
 const gemini = require('../services/gemini');
 const calc   = require('../utils/calculator');
 
-// In-memory store buat nyimpen last log ID per user
-// Dipake buat fitur /adjust — tau log mana yang mau dikoreksi
-const lastLogIdMap = new Map(); // key: telegramId, value: logId
-
-// In-memory store buat tau user lagi di mode adjust atau engga
-const adjustModeMap = new Map(); // key: telegramId, value: logId
+const lastLogIdMap  = new Map(); // last log ID per user (buat /adjust)
+const adjustModeMap = new Map(); // user lagi di mode adjust atau engga
 
 async function reply(ctx, text, extra = {}) {
     return ctx.reply(text, { parse_mode: 'Markdown', ...extra });
@@ -20,28 +16,21 @@ async function reply(ctx, text, extra = {}) {
 
 // ─── COMMAND HANDLERS ────────────────────────────────────────
 
-/**
- * /start atau /mulai
- * PENTING: kalau user udah registered, langsung sambut — jangan reset data!
- */
 async function handleStart(ctx) {
     const tgId   = ctx.from.id;
     const tgName = ctx.from.first_name || 'bestie';
 
-    // Cek dulu apakah user udah pernah daftar
     const existingUser = await db.getUser(tgId);
 
-    // Kalau udah registered, sambut langsung tanpa reset
     if (existingUser?.is_registered) {
         await reply(ctx,
             `Heyy ${existingUser.name}! 👋 Welcome back!\n\n` +
             `Target kalori lo: *${Math.round(existingUser.daily_calorie_goal)} kkal/hari*\n\n` +
-            `Kirim *foto makanan* buat mulai log, atau ketik /help buat list command! 😊`
+            `Kirim *foto makanan* buat mulai log, atau ketik /help! 😊`
         );
         return;
     }
 
-    // Kalau belum, mulai registrasi
     await db.upsertUser(tgId, {
         username: ctx.from.username || null,
         registration_step: 'ask_name',
@@ -58,13 +47,17 @@ async function handleStart(ctx) {
 async function handleHelp(ctx) {
     await reply(ctx,
         `🤖 *NutriBot — Command List:*\n\n` +
-        `/mulai — daftar (kalau belum) atau lihat status\n` +
-        `/status — cek sisa kalori hari ini\n` +
-        `/laporan — progress 7 hari terakhir\n` +
-        `/profil — lihat & update data profil\n` +
-        `/reset — hapus semua log kalori hari ini\n` +
-        `/adjust — koreksi hasil analisis terakhir\n` +
-        `/help — tampilkan menu ini\n\n` +
+        `*/mulai* — daftar atau lihat status\n` +
+        `*/status* — cek sisa kalori hari ini\n` +
+        `*/laporan* — progress 7 hari terakhir\n` +
+        `*/streak* — cek konsistensi log harian lo\n` +
+        `*/target [kg]* — set target berat badan\n` +
+        `*/remind [HH:MM]* — set reminder harian\n` +
+        `*/remind off* — matiin reminder\n` +
+        `*/profil* — lihat & update data profil\n` +
+        `*/reset* — hapus semua log kalori hari ini\n` +
+        `*/adjust* — koreksi hasil analisis terakhir\n` +
+        `*/help* — tampilkan menu ini\n\n` +
         `📸 *Kirim foto makanan* → auto analisis nutrisi!\n\n` +
         `_Powered by Gemini 2.5 Flash_ 🤖`
     );
@@ -135,7 +128,9 @@ async function handleProfil(ctx) {
         `Berat: *${user.weight_kg} kg*\n` +
         `BMR: *${Math.round(user.bmr)} kkal/hari*\n` +
         `TDEE: *${Math.round(user.tdee)} kkal/hari*\n` +
-        `Target: *${Math.round(user.daily_calorie_goal)} kkal/hari*\n\n` +
+        `Target kalori: *${Math.round(user.daily_calorie_goal)} kkal/hari*\n` +
+        `Target berat: *${user.target_weight ? user.target_weight + ' kg' : 'belum diset'}*\n` +
+        `Reminder: *${user.reminder_time ? user.reminder_time + ' WIB' : 'off'}*\n\n` +
         `_Mau update profil? Ketik /mulai lagi_`,
         {
             reply_markup: {
@@ -147,10 +142,6 @@ async function handleProfil(ctx) {
     );
 }
 
-/**
- * /reset — hapus semua log kalori hari ini
- * Minta konfirmasi dulu sebelum hapus biar gak salah pencet
- */
 async function handleReset(ctx) {
     const tgId = ctx.from.id;
     const user = await db.getUser(tgId);
@@ -162,13 +153,11 @@ async function handleReset(ctx) {
 
     const summary = await db.getDailySummary(tgId);
 
-    // Kalau emang belum ada log hari ini
     if (!summary.meal_count || summary.meal_count === 0) {
         await reply(ctx, `📭 Belum ada log makanan hari ini, jadi gak ada yang perlu di-reset!`);
         return;
     }
 
-    // Minta konfirmasi dulu pakai inline keyboard
     await reply(ctx,
         `⚠️ *Yakin mau reset log hari ini?*\n\n` +
         `Yang akan dihapus:\n` +
@@ -178,18 +167,14 @@ async function handleReset(ctx) {
         {
             reply_markup: {
                 inline_keyboard: [[
-                    { text: '✅ Ya, Reset!',  callback_data: 'confirm_reset' },
-                    { text: '❌ Batalin',     callback_data: 'cancel_reset'  }
+                    { text: '✅ Ya, Reset!', callback_data: 'confirm_reset' },
+                    { text: '❌ Batalin',    callback_data: 'cancel_reset'  }
                 ]]
             }
         }
     );
 }
 
-/**
- * /adjust — koreksi deskripsi hasil analisis terakhir
- * User bisa bilang "itu bukan nasi goreng tapi nasi putih biasa"
- */
 async function handleAdjust(ctx) {
     const tgId = ctx.from.id;
     const user = await db.getUser(tgId);
@@ -199,7 +184,7 @@ async function handleAdjust(ctx) {
         return;
     }
 
-    const lastLogId = lastLogIdMap.get(tgId); // ambil ID log terakhir dari memory
+    const lastLogId = lastLogIdMap.get(tgId);
 
     if (!lastLogId) {
         await reply(ctx,
@@ -209,32 +194,242 @@ async function handleAdjust(ctx) {
         return;
     }
 
-    // Set user ke mode adjust — pesan teks berikutnya akan diproses sebagai koreksi
     adjustModeMap.set(tgId, lastLogId);
 
     await reply(ctx,
         `✏️ *Mode Koreksi Aktif*\n\n` +
         `Ketik deskripsi makanan yang bener ya!\n\n` +
-        `_Contoh: "nasi putih 1 porsi, ayam goreng 1 potong, tempe goreng 2 potong"_\n\n` +
+        `_Contoh: "nasi putih 1 porsi, ayam goreng 1 potong, tempe 2 potong"_\n\n` +
         `Atau ketik /batal buat cancel`
     );
 }
 
-// ─── TEXT HANDLER (State Machine) ────────────────────────────
+// ─── NEW: STREAK ──────────────────────────────────────────────
+
+/**
+ * /streak — tampilkan berapa hari berturut-turut user log makanan
+ */
+async function handleStreak(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    const streak = await db.getStreak(tgId);
+
+    // Pilih emoji dan pesan sesuai panjang streak
+    let streakEmoji, streakMsg;
+
+    if (streak === 0) {
+        streakEmoji = '😴';
+        streakMsg   = `Belum ada streak nih. Yuk mulai log hari ini! 💪`;
+    } else if (streak < 3) {
+        streakEmoji = '🔥';
+        streakMsg   = `Good start! Pertahanin terus ya!`;
+    } else if (streak < 7) {
+        streakEmoji = '🔥🔥';
+        streakMsg   = `Mantap! Lo lagi on fire nih!`;
+    } else if (streak < 14) {
+        streakEmoji = '🔥🔥🔥';
+        streakMsg   = `Seminggu lebih konsisten — lo serius nih! Respect! 🫡`;
+    } else if (streak < 30) {
+        streakEmoji = '⚡';
+        streakMsg   = `2 minggu lebih?! Lo literally lagi ngebangun habit baru. Beast mode! 💪`;
+    } else {
+        streakEmoji = '👑';
+        streakMsg   = `${streak} hari?! Bro lo udah level dewa konsistensi. Salute! 🫡`;
+    }
+
+    // Cek apakah hari ini udah ada log
+    const todaySummary = await db.getDailySummary(tgId);
+    const loggedToday  = todaySummary.meal_count > 0;
+
+    await reply(ctx,
+        `${streakEmoji} *Streak Lo:*\n\n` +
+        `🗓️ *${streak} hari berturut-turut* log makanan!\n\n` +
+        `${streakMsg}\n\n` +
+        `${loggedToday
+            ? `✅ Hari ini udah ke-log — streak aman!`
+            : `⚠️ Hari ini belum ada log — kirim foto makanan buat jaga streak!`
+        }`
+    );
+}
+
+// ─── NEW: TARGET ──────────────────────────────────────────────
+
+/**
+ * /target [berat] — set target berat badan dan estimasi waktu tercapai
+ * Contoh: /target 80
+ */
+async function handleTarget(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    // Ambil angka dari pesan — /target 80 → ambil "80"
+    const args         = ctx.message.text.split(' ');
+    const targetWeight = parseFloat(args[1]);
+
+    // Kalau gak ada angka, tampilkan target yang sudah ada
+    if (!args[1]) {
+        if (user.target_weight) {
+            const currentWeight = user.weight_kg;
+            const remaining     = currentWeight - user.target_weight;
+            const weeklyLoss    = (parseInt(process.env.CALORIE_DEFICIT) || 500) * 7 / 7700;
+            const weeksLeft     = Math.ceil(remaining / weeklyLoss);
+
+            await reply(ctx,
+                `🎯 *Target Berat Lo:*\n\n` +
+                `Berat sekarang: *${currentWeight} kg*\n` +
+                `Target: *${user.target_weight} kg*\n` +
+                `Sisa: *${remaining.toFixed(1)} kg* lagi\n\n` +
+                `📅 Estimasi tercapai: *~${weeksLeft} minggu lagi*\n` +
+                `_(asumsi deficit ${process.env.CALORIE_DEFICIT || 500} kkal/hari konsisten)_\n\n` +
+                `_Mau ganti target? Ketik /target [angka berat baru]_`
+            );
+        } else {
+            await reply(ctx,
+                `Lo belum set target berat nih!\n\n` +
+                `Caranya: ketik */target [angka]*\n` +
+                `Contoh: \`/target 80\``
+            );
+        }
+        return;
+    }
+
+    // Validasi input
+    if (isNaN(targetWeight) || targetWeight < 30 || targetWeight > 300) {
+        await reply(ctx, `Target berat harus angka antara 30-300 kg ya. Coba lagi!`);
+        return;
+    }
+
+    const currentWeight = user.weight_kg;
+
+    // Cek apakah target masuk akal
+    if (targetWeight >= currentWeight) {
+        await reply(ctx,
+            `Hmm, target lo (${targetWeight} kg) sama atau lebih dari berat sekarang (${currentWeight} kg) nih. 🤔\n\n` +
+            `Buat diet, target harusnya *lebih kecil* dari berat sekarang ya!\n` +
+            `Contoh: kalau berat lo ${currentWeight} kg, coba \`/target ${Math.round(currentWeight - 5)}\``
+        );
+        return;
+    }
+
+    // Simpan ke DB
+    await db.setTargetWeight(tgId, targetWeight);
+
+    // Hitung estimasi waktu
+    // Rumus: 1 kg lemak ≈ 7700 kkal
+    // Deficit per hari (dari .env) → loss per minggu = deficit × 7 / 7700
+    const deficit      = parseInt(process.env.CALORIE_DEFICIT) || 500;
+    const weeklyLossKg = (deficit * 7) / 7700;           // kg per minggu
+    const totalLoss    = currentWeight - targetWeight;    // total yang harus turun
+    const weeksNeeded  = Math.ceil(totalLoss / weeklyLossKg); // minggu yang dibutuhkan
+    const monthsNeeded = (weeksNeeded / 4.3).toFixed(1); // konversi ke bulan
+
+    // Hitung tanggal estimasi tercapai
+    const targetDate = new Date();
+    targetDate.setDate(targetDate.getDate() + weeksNeeded * 7);
+    const targetDateStr = targetDate.toLocaleDateString('id-ID', {
+        day: 'numeric', month: 'long', year: 'numeric'
+    });
+
+    await reply(ctx,
+        `🎯 *Target Berat Tersimpan!*\n\n` +
+        `Berat sekarang: *${currentWeight} kg*\n` +
+        `Target lo: *${targetWeight} kg*\n` +
+        `Yang harus turun: *${totalLoss.toFixed(1)} kg*\n\n` +
+        `📅 *Estimasi tercapai:*\n` +
+        `~${weeksNeeded} minggu (~${monthsNeeded} bulan)\n` +
+        `Kira-kira: *${targetDateStr}*\n\n` +
+        `_(asumsi deficit ${deficit} kkal/hari konsisten)_\n\n` +
+        `💪 You got this! Satu langkah sekaligus!`
+    );
+}
+
+// ─── NEW: REMIND ──────────────────────────────────────────────
+
+/**
+ * /remind [HH:MM] — set reminder harian
+ * /remind off — matiin reminder
+ * Contoh: /remind 07:00
+ */
+async function handleRemind(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    const args  = ctx.message.text.split(' ');
+    const input = args[1]?.toLowerCase();
+
+    // Kalau gak ada argument, tampilkan status reminder sekarang
+    if (!input) {
+        await reply(ctx,
+            `⏰ *Reminder Lo:*\n\n` +
+            `Status: *${user.reminder_time ? user.reminder_time + ' WIB — aktif ✅' : 'off ❌'}*\n\n` +
+            `Cara set: \`/remind 07:00\`\n` +
+            `Cara matiin: \`/remind off\`\n\n` +
+            `_Reminder bakal kirim pesan ke lo setiap hari di jam yang lo set_ ⏰`
+        );
+        return;
+    }
+
+    // Matiin reminder
+    if (input === 'off') {
+        await db.setReminderTime(tgId, null);
+        await reply(ctx, `✅ Reminder dimatiin. Lo bisa nyalain lagi kapanpun dengan \`/remind HH:MM\``);
+        return;
+    }
+
+    // Validasi format waktu HH:MM
+    const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/; // regex: 00:00 sampai 23:59
+    if (!timeRegex.test(input)) {
+        await reply(ctx,
+            `Format waktu salah nih! 🤔\n\n` +
+            `Harus format *HH:MM* (24 jam)\n` +
+            `Contoh:\n` +
+            `• \`/remind 07:00\` → pagi jam 7\n` +
+            `• \`/remind 12:30\` → siang jam setengah 1\n` +
+            `• \`/remind 19:00\` → malem jam 7`
+        );
+        return;
+    }
+
+    // Simpan ke DB
+    await db.setReminderTime(tgId, input);
+
+    await reply(ctx,
+        `✅ *Reminder aktif!*\n\n` +
+        `Lo bakal diingetin setiap hari jam *${input} WIB* 🕐\n\n` +
+        `Bot bakal cek progress lo dan kasih tau sisa kalori hari itu.\n\n` +
+        `_Mau ganti jam? Tinggal \`/remind [jam baru]\` aja_\n` +
+        `_Mau matiin? Ketik \`/remind off\`_`
+    );
+}
+
+// ─── TEXT HANDLER ────────────────────────────────────────────
 
 async function handleText(ctx) {
     const tgId = ctx.from.id;
     const body = ctx.message.text?.trim() || '';
     const user = await db.getUser(tgId);
 
-    // ── Handle mode adjust ──────────────────────────────────
-    // Cek ini PERTAMA sebelum apapun
     if (adjustModeMap.has(tgId)) {
         await handleAdjustInput(ctx, tgId, body);
         return;
     }
 
-    // ── Handle /batal command ───────────────────────────────
     if (body.toLowerCase() === '/batal' || body.toLowerCase() === 'batal') {
         adjustModeMap.delete(tgId);
         await reply(ctx, `Oke, koreksi dibatalin! 👌`);
@@ -260,9 +455,6 @@ async function handleText(ctx) {
     await processRegistrationStep(ctx, tgId, user, body);
 }
 
-/**
- * Handle input teks saat user di mode /adjust
- */
 async function handleAdjustInput(ctx, tgId, newDescription) {
     const logId = adjustModeMap.get(tgId);
 
@@ -273,13 +465,12 @@ async function handleAdjustInput(ctx, tgId, newDescription) {
 
     try {
         await db.updateFoodLogDescription(logId, newDescription);
-        adjustModeMap.delete(tgId); // keluar dari mode adjust
+        adjustModeMap.delete(tgId);
 
         await reply(ctx,
             `✅ *Deskripsi berhasil diupdate!*\n\n` +
             `🍽️ *${newDescription}*\n\n` +
-            `_Note: kalori & nutrisi tetap dari estimasi awal Gemini ya. ` +
-            `Kalau mau recalculate, hapus log ini dan kirim foto ulang._`
+            `_Note: kalori & nutrisi tetap dari estimasi awal Gemini ya._`
         );
     } catch (err) {
         await reply(ctx, `😵 Gagal update deskripsi. Coba lagi ya!`);
@@ -298,7 +489,7 @@ async function processRegistrationStep(ctx, tgId, user, body) {
                 return;
             }
             await db.upsertUser(tgId, { name: body, registration_step: 'ask_age' });
-            await reply(ctx, `Nice, *${body}*! 😄\n\nSekarang, *umur lo berapa?*\n_(ketik angkanya aja, contoh: 25)_`);
+            await reply(ctx, `Nice, *${body}*! 😄\n\nSekarang, *umur lo berapa?*\n_(contoh: 25)_`);
             break;
         }
 
@@ -368,20 +559,16 @@ async function handleCallbackQuery(ctx) {
 
     await ctx.answerCbQuery();
 
-    // ── Konfirmasi Reset ────────────────────────────────────
     if (data === 'confirm_reset') {
         try {
             const deleted = await db.deleteTodayLogs(tgId);
-            lastLogIdMap.delete(tgId);  // hapus juga last log ID dari memory
-            adjustModeMap.delete(tgId); // pastiin mode adjust juga di-clear
-
+            lastLogIdMap.delete(tgId);
+            adjustModeMap.delete(tgId);
             await ctx.editMessageText(
-                `✅ *Reset berhasil!*\n\n` +
-                `${deleted} log makanan hari ini udah dihapus.\n` +
-                `Kalori lo balik ke *0 kkal*. Fresh start! 💪`,
+                `✅ *Reset berhasil!*\n\n${deleted} log dihapus. Fresh start! 💪`,
                 { parse_mode: 'Markdown' }
             );
-        } catch (err) {
+        } catch {
             await ctx.editMessageText(`❌ Gagal reset. Coba lagi ya!`);
         }
         return;
@@ -392,15 +579,13 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
-    // ── Update Profil ───────────────────────────────────────
     if (data === 'update_profile') {
         await db.upsertUser(tgId, { registration_step: 'ask_name', is_registered: false });
         await ctx.editMessageText(`Oke, let's update profil lo! 📝`);
-        await reply(ctx, `*Nama panggilan lo siapa?*\n_(ketik nama baru, atau nama yang sama)_`);
+        await reply(ctx, `*Nama panggilan lo siapa?*`);
         return;
     }
 
-    // ── Pilihan Gender ──────────────────────────────────────
     if (data.startsWith('gender_')) {
         const gender = data.replace('gender_', '');
         await db.upsertUser(tgId, { gender, registration_step: 'ask_height' });
@@ -412,10 +597,9 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
-    // ── Pilihan Aktivitas ───────────────────────────────────
     if (data.startsWith('activity_')) {
         const activityLevel = data.replace('activity_', '');
-        const user = await db.getUser(tgId);
+        const user          = await db.getUser(tgId);
 
         const bmr       = calc.calculateBMR(user.weight_kg, user.height_cm, user.age, user.gender);
         const tdee      = calc.calculateTDEE(bmr, activityLevel);
@@ -435,14 +619,9 @@ async function handleCallbackQuery(ctx) {
         );
 
         await reply(ctx,
-            `Yeaay! Profil *tersimpan*, ${user.name}! 🎉\n\n` +
+            `Yeaay! Profil *tersimpan*! 🎉\n\n` +
             calc.formatCalorieReport(bmr, tdee, dailyGoal, activityLevel) +
-            `\n\n💡 *Cara pakainya:*\n` +
-            `• Kirim *foto makanan* → gua analisis nutrisinya\n` +
-            `• /status → cek sisa kalori hari ini\n` +
-            `• /reset → hapus log hari ini\n` +
-            `• /adjust → koreksi analisis terakhir\n\n` +
-            `_Let's get healthy! 💪_`
+            `\n\n_Let's get healthy! 💪_`
         );
     }
 }
@@ -458,14 +637,9 @@ async function handlePhoto(ctx) {
         return;
     }
 
-    // Kalau lagi di mode adjust, cancel dulu
-    if (adjustModeMap.has(tgId)) {
-        adjustModeMap.delete(tgId);
-    }
+    if (adjustModeMap.has(tgId)) adjustModeMap.delete(tgId);
 
-    const loadingMsg = await reply(ctx,
-        `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`
-    );
+    const loadingMsg = await reply(ctx, `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`);
 
     try {
         const photos    = ctx.message.photo;
@@ -479,14 +653,11 @@ async function handlePhoto(ctx) {
         if (!result.is_food) {
             await ctx.telegram.editMessageText(
                 ctx.chat.id, loadingMsg.message_id, null,
-                `Hmm, kayaknya itu bukan foto makanan deh... 🤔\n` +
-                `Coba kirim foto yang ada makanannya ya!\n\n` +
-                `_Tips: pastiin pencahayaan cukup & makanan keliatan jelas_ 📸`
+                `Hmm, kayaknya itu bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya ya!\n\n_Tips: pastiin pencahayaan cukup_ 📸`
             );
             return;
         }
 
-        // Simpan ke DB dan simpan ID-nya buat fitur /adjust
         const savedLog = await db.insertFoodLog(tgId, {
             food_description: result.food_description,
             calories:         result.calories,
@@ -496,7 +667,6 @@ async function handlePhoto(ctx) {
             gemini_raw:       result.gemini_raw
         });
 
-        // Simpan last log ID ke memory (dipake kalau user /adjust)
         lastLogIdMap.set(tgId, savedLog.id);
 
         const summary   = await db.getDailySummary(tgId);
@@ -507,7 +677,8 @@ async function handlePhoto(ctx) {
             ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
             : `⚠️ Lo udah *over ${Math.abs(Math.round(remaining))} kkal* dari target!`;
 
-        const resultText =
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, null,
             `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
             `🍽️ *${result.food_description}*\n\n` +
             `🔥 Kalori: *${result.calories} kkal*\n` +
@@ -520,24 +691,18 @@ async function handlePhoto(ctx) {
             `━━━━━━━━━━━━━━\n` +
             `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
             `${remainingText}\n\n` +
-            `_Salah analisis? Ketik /adjust untuk koreksi_ ✏️`;
-
-        await ctx.telegram.editMessageText(
-            ctx.chat.id, loadingMsg.message_id, null,
-            resultText,
+            `_Salah analisis? Ketik /adjust_ ✏️`,
             { parse_mode: 'Markdown' }
         );
 
     } catch (err) {
         console.error(`[PhotoHandler] Error for ${tgId}:`, err.message);
-
-        const errorMessages = {
+        const errMsg = {
             'RATE_LIMIT':   `⏳ Gemini lagi overload. Tunggu ~1 menit terus coba lagi ya!`,
-            'SAFETY_BLOCK': `🚫 Gambar gak bisa diproses. Kirim foto makanan biasa aja ya!`,
-            'GEMINI_ERROR': `😵 Ada error di analisis gambar. Coba kirim ulang!`,
-        };
+            'SAFETY_BLOCK': `🚫 Gambar gak bisa diproses. Kirim foto makanan biasa aja!`,
+            'GEMINI_ERROR': `😵 Ada error. Coba kirim ulang!`,
+        }[err.message] || `❌ Something went wrong. Coba lagi ya!`;
 
-        const errMsg = errorMessages[err.message] || `❌ Something went wrong. Coba lagi ya!`;
         await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
             .catch(() => reply(ctx, errMsg));
     }
@@ -571,5 +736,6 @@ function buildStatusMessage(summary, dailyGoal) {
 module.exports = {
     handleStart, handleHelp, handleStatus, handleLaporan,
     handleProfil, handleReset, handleAdjust,
+    handleStreak, handleTarget, handleRemind,
     handleText, handleCallbackQuery, handlePhoto
 };

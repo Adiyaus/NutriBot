@@ -1,23 +1,18 @@
 // ============================================================
 // src/index.js
-// Update: tambah handler /reset dan /adjust
+// Update: register /streak, /target, /remind + init reminder cron
 // ============================================================
 
 require('dotenv').config();
 
-const { Telegraf } = require('telegraf');
+const { Telegraf }      = require('telegraf');
+const { initReminder }  = require('./services/reminder');
 
 const {
-    handleStart,
-    handleHelp,
-    handleStatus,
-    handleLaporan,
-    handleProfil,
-    handleReset,
-    handleAdjust,
-    handleText,
-    handleCallbackQuery,
-    handlePhoto
+    handleStart, handleHelp, handleStatus, handleLaporan,
+    handleProfil, handleReset, handleAdjust,
+    handleStreak, handleTarget, handleRemind,
+    handleText, handleCallbackQuery, handlePhoto
 } = require('./handlers/messageHandler');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -31,6 +26,9 @@ bot.command('laporan', handleLaporan);
 bot.command('profil',  handleProfil);
 bot.command('reset',   handleReset);
 bot.command('adjust',  handleAdjust);
+bot.command('streak',  handleStreak);
+bot.command('target',  handleTarget);
+bot.command('remind',  handleRemind);
 
 // ─── MESSAGE HANDLERS ────────────────────────────────────────
 bot.on('photo',          handlePhoto);
@@ -48,6 +46,10 @@ bot.launch()
     .then(() => {
         console.log(`\n✅ ${process.env.BOT_NAME || 'NutriBot'} aktif!`);
         console.log(`⏰ Started: ${new Date().toLocaleString('id-ID')}\n`);
+
+        // Inisialisasi reminder cron setelah bot ready
+        // Passing bot instance biar cron bisa kirim pesan
+        initReminder(bot);
     })
     .catch(err => {
         console.error('❌ Gagal start bot:', err.message);
