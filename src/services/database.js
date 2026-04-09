@@ -176,6 +176,29 @@ async function getDailySummary(telegramId) {
     };
 }
 
+/**
+ * Ambil list makanan yang sudah di-log hari ini
+ * Dipake buat tampilkan detail di /status
+ * @param {number} telegramId
+ * @returns {Array} list { food_description, calories, logged_at }
+ */
+async function getTodayFoodList(telegramId) {
+    const today = new Date().toISOString().split('T')[0];
+
+    const { data, error } = await supabase
+        .from('food_logs')
+        .select('id, food_description, calories, protein_g, carbs_g, fat_g, logged_at')
+        .eq('telegram_id', telegramId)
+        .eq('log_date', today)
+        .order('logged_at', { ascending: true }); // urut dari yang pertama dimakan
+
+    if (error) {
+        console.error('[DB] getTodayFoodList error:', error.message);
+        return [];
+    }
+    return data || [];
+}
+
 async function getWeeklyLogs(telegramId) {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -306,7 +329,7 @@ module.exports = {
     getStreak, setTargetWeight, setReminderTime, getUsersWithReminder,
     // food logs
     insertFoodLog, updateFoodLogDescription, deleteTodayLogs,
-    getDailySummary, getWeeklyLogs,
+    getDailySummary, getTodayFoodList, getWeeklyLogs,
     // saved menus
     saveMenu, getSavedMenus, getSavedMenuById,
     incrementMenuUseCount, deleteMenu

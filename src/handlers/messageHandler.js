@@ -75,8 +75,13 @@ async function handleStatus(ctx) {
         return;
     }
 
-    const summary = await db.getDailySummary(tgId);
-    await reply(ctx, buildStatusMessage(summary, user.daily_calorie_goal));
+    // Ambil summary + list makanan hari ini secara paralel (lebih cepat)
+    const [summary, foodList] = await Promise.all([
+        db.getDailySummary(tgId),
+        db.getTodayFoodList(tgId)
+    ]);
+
+    await reply(ctx, buildStatusMessage(summary, user.daily_calorie_goal, foodList));
 }
 
 async function handleLaporan(ctx) {
@@ -501,6 +506,9 @@ async function handleCatat(ctx) {
                 }
             }
         );
+
+        // Generate & kirim coaching insight secara async
+        generateAndSendCoaching(ctx, tgId, user, summary, result);
 
     } catch (err) {
         console.error(`[CatatHandler] Error for ${tgId}:`, err.message);
@@ -980,6 +988,10 @@ async function handlePhoto(ctx) {
             }
         );
 
+        // Generate & kirim coaching insight secara async
+        // Kirim sebagai pesan terpisah biar gak nunggu lama
+        generateAndSendCoaching(ctx, tgId, user, summary, result);
+
     } catch (err) {
         console.error(`[PhotoHandler] Error for ${tgId}:`, err.message);
         const errMsg = {
@@ -993,6 +1005,37 @@ async function handlePhoto(ctx) {
     }
 }
 
+// ─── COACHING HELPER ─────────────────────────────────────────
+
+/**
+ * Generate dan kirim coaching insight sebagai pesan terpisah
+ * Dipanggil secara fire-and-forget (gak di-await) biar gak delay response utama
+ *
+ * @param {object} ctx - Telegraf context
+ * @param {number} tgId
+ * @param {object} user
+ * @param {object} todaySummary
+ * @param {object} lastFood - makanan yang baru di-log
+ */
+async function generateAndSendCoaching(ctx, tgId, user, todaySummary, lastFood) {
+    try {
+        const coaching = await gemini.generateDailyCoaching(user, todaySummary, lastFood);
+
+        // Kalau Gemini gagal generate, skip aja — jangan ganggu user
+        if (!coaching) return;
+
+        // Kirim sebagai pesan baru dengan styling coach
+        await ctx.telegram.sendMessage(tgId,
+            `💬 *Coach says:*\n\n${coaching}`,
+            { parse_mode: 'Markdown' }
+        );
+
+    } catch (err) {
+        // Coaching gagal → diem aja, jangan ganggu user experience
+        console.error('[Coaching] Failed to send:', err.message);
+    }
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────
 
 function buildProgressBar(pct) {
@@ -1000,10 +1043,39 @@ function buildProgressBar(pct) {
     return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
-function buildStatusMessage(summary, dailyGoal) {
+/**
+ * Build pesan status harian — sekarang include list makanan yang sudah dimakan
+ * @param {object} summary - total nutrisi hari ini
+ * @param {number} dailyGoal - target kalori
+ * @param {Array} foodList - list makanan yang sudah di-log (opsional)
+ */
+function buildStatusMessage(summary, dailyGoal, foodList = []) {
     const consumed   = Math.round(summary.total_calories || 0);
     const remaining  = Math.round(dailyGoal - consumed);
     const percentage = Math.min(100, Math.round((consumed / dailyGoal) * 100));
+
+    // Build food list section kalau ada data
+    let foodListText = '';
+    if (foodList.length > 0) {
+        foodListText = `\n🍽️ *Yang Udah Dimakan:*\n`;
+        foodList.forEach((food, i) => {
+            // Format jam dari logged_at (WIB = UTC+7)
+            const loggedAt  = new Date(food.logged_at);
+            const wibHour   = String((loggedAt.getUTCHours() + 7) % 24).padStart(2, '0');
+            const wibMinute = String(loggedAt.getUTCMinutes()).padStart(2, '0');
+            const timeStr   = `${wibHour}:${wibMinute}`;
+
+            // Truncate nama makanan kalau terlalu panjang
+            const name = food.food_description.length > 40
+                ? food.food_description.substring(0, 40) + '...'
+                : food.food_description;
+
+            foodListText += `${i + 1}. ${name}\n`;
+            foodListText += `    _${timeStr} WIB • ${Math.round(food.calories)} kkal_\n`;
+        });
+    } else {
+        foodListText = `\n_Belum ada log makanan hari ini_ 📭\n`;
+    }
 
     return (
         `📊 *Status Kalori Hari Ini:*\n\n` +
@@ -1012,9 +1084,12 @@ function buildStatusMessage(summary, dailyGoal) {
         `📉 Sisa: *${remaining > 0 ? remaining : 0} kkal*\n\n` +
         `💪 Protein: ${(summary.total_protein || 0).toFixed(1)}g\n` +
         `🍚 Karbo: ${(summary.total_carbs || 0).toFixed(1)}g\n` +
-        `🥑 Lemak: ${(summary.total_fat || 0).toFixed(1)}g\n\n` +
-        `🍽️ Udah makan ${summary.meal_count || 0}x hari ini\n\n` +
-        `${remaining < 0 ? '⚠️ _Lo over budget kalori hari ini!_' : '✅ _Keep going, lo on track!_'}`
+        `🥑 Lemak: ${(summary.total_fat || 0).toFixed(1)}g\n` +
+        foodListText +
+        `\n${remaining < 0
+            ? '⚠️ _Lo over budget kalori hari ini!_'
+            : '✅ _Keep going, lo on track!_'
+        }`
     );
 }
 
