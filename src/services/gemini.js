@@ -88,32 +88,46 @@ async function callGemini(contents) {
             return response.text; // sukses → return langsung
 
         } catch (err) {
-            const isRateLimit = err.status === 429
-                || err.message?.includes('429')
-                || err.message?.includes('quota')
-                || err.message?.includes('RATE_LIMIT');
+            // Stringify semua property error biar gak ada yang kelewat
+            // SDK baru @google/genai pakai "RESOURCE_EXHAUSTED" bukan status 429
+            const errStr = [
+                String(err?.message  || ''),
+                String(err?.status   || ''),
+                String(err?.code     || ''),
+                JSON.stringify(err?.errorDetails || ''),
+                JSON.stringify(err?.error        || '')
+            ].join(' ').toLowerCase();
+
+            const isRateLimit =
+                err?.status === 429                        ||
+                err?.status === 'RESOURCE_EXHAUSTED'      || // SDK baru
+                errStr.includes('429')                    ||
+                errStr.includes('resource_exhausted')     || // key error message
+                errStr.includes('quota')                  ||
+                errStr.includes('rate_limit')             ||
+                errStr.includes('rate limit');
 
             if (isRateLimit) {
-                // Coba rotate ke key berikutnya
+                console.log(`[Gemini] Key ${currentKeyIdx + 1} rate limit — rotate...`);
+
                 const hasMore = rotateKey();
 
                 if (!hasMore || triedKeys.has(currentKeyIdx)) {
-                    // Semua key sudah dicoba dan kena rate limit semua
+                    console.warn('[Gemini] Semua key exhausted!');
                     throw new Error('RATE_LIMIT');
                 }
-                // Lanjut loop — coba dengan key baru
-                continue;
+                continue; // coba key berikutnya
             }
 
-            // Error bukan rate limit — langsung throw
-            if (err.message?.includes('SAFETY'))  throw new Error('SAFETY_BLOCK');
+            // Error bukan rate limit
+            if (errStr.includes('safety'))         throw new Error('SAFETY_BLOCK');
             if (err.message === 'PARSE_ERROR')     throw new Error('PARSE_ERROR');
-            console.error('[Gemini] Error:', err.message);
+            console.error('[Gemini] Non-rate-limit error:', err.message || err);
             throw new Error('GEMINI_ERROR');
         }
     }
 
-    throw new Error('RATE_LIMIT'); // fallback kalau somehow keluar loop
+    throw new Error('RATE_LIMIT');
 }
 
 // ─── DOWNLOAD IMAGE ───────────────────────────────────────────
