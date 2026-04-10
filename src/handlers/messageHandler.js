@@ -508,9 +508,6 @@ async function handleCatat(ctx) {
             }
         );
 
-        // Generate & kirim coaching insight secara async
-        generateAndSendCoaching(ctx, tgId, user, summary, result);
-
     } catch (err) {
         console.error(`[CatatHandler] Error for ${tgId}:`, err.message);
         const errMsg = {
@@ -826,17 +823,6 @@ async function handleCallbackQuery(ctx) {
             `📊 *Progress Hari Ini:*\n${remainingText}`,
             { parse_mode: 'Markdown' }
         );
-
-        // Kirim coaching + food recommendation sama kayak habis foto/catat
-        // Format menu jadi object yang kompatibel dengan generateAndSendCoaching
-        const menuAsFood = {
-            food_description: menu.food_description,
-            calories:         menu.calories,
-            protein_g:        menu.protein_g,
-            carbs_g:          menu.carbs_g,
-            fat_g:            menu.fat_g
-        };
-        generateAndSendCoaching(ctx, tgId, user, summary, menuAsFood);
         return;
     }
 
@@ -1000,10 +986,6 @@ async function handlePhoto(ctx) {
             }
         );
 
-        // Generate & kirim coaching insight secara async
-        // Kirim sebagai pesan terpisah biar gak nunggu lama
-        generateAndSendCoaching(ctx, tgId, user, summary, result);
-
     } catch (err) {
         console.error(`[PhotoHandler] Error for ${tgId}:`, err.message);
         const errMsg = {
@@ -1097,26 +1079,6 @@ async function handleTanya(ctx) {
 }
 
 // ─── COACHING HELPER ─────────────────────────────────────────
-
-/**
- * Generate dan kirim food recommendation setelah log makan
- * Daily coaching dihapus buat hemat Gemini API quota
- */
-async function generateAndSendCoaching(ctx, tgId, user, todaySummary, lastFood) {
-    try {
-        const recommendation = await gemini.generateFoodRecommendation(user, todaySummary, lastFood);
-
-        if (recommendation) {
-            await ctx.telegram.sendMessage(tgId,
-                recommendation,
-                { parse_mode: 'Markdown' }
-            );
-        }
-
-    } catch (err) {
-        console.error('[FoodRec] Failed to send:', err.message);
-    }
-}
 
 // ─── HELPERS ─────────────────────────────────────────────────
 

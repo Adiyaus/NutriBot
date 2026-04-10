@@ -298,17 +298,6 @@ function handleGeminiError(err) {
  * @returns {string} pesan coaching singkat dari "coach"
  */
 
-// ─── HELPER ───────────────────────────────────────────────────
-
-function getTimeOfDay() {
-    // Jam WIB (UTC+7)
-    const wibHour = (new Date().getUTCHours() + 7) % 24;
-    if (wibHour >= 5  && wibHour < 11) return 'pagi';
-    if (wibHour >= 11 && wibHour < 15) return 'siang';
-    if (wibHour >= 15 && wibHour < 18) return 'sore';
-    return 'malam';
-}
-
 /**
  * Jawab pertanyaan user seputar diet, nutrisi, olahraga
  * Dipersonalisasi berdasarkan data profil user
@@ -377,72 +366,9 @@ Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
     }
 }
 
-/**
- * Generate rekomendasi makanan berikutnya
- * Dipanggil setelah user log makan (foto atau /catat)
- *
- * @param {object} user - profil user
- * @param {object} todaySummary - total nutrisi hari ini (sudah include log terbaru)
- * @param {object} lastFood - makanan yang baru saja di-log
- * @returns {string} rekomendasi makanan dalam format teks
- */
-async function generateFoodRecommendation(user, todaySummary, lastFood) {
-    const remaining     = user.daily_calorie_goal - (todaySummary.total_calories || 0);
-    const remainingProt = Math.max(0, 100 - (todaySummary.total_protein || 0)); // estimasi kebutuhan protein ~100g
-    const mealCount     = todaySummary.meal_count || 1;
-    const timeOfDay     = getTimeOfDay();
-
-    // Kalau kalori udah habis atau over, skip rekomendasi
-    if (remaining <= 50) return null;
-
-    const prompt = `
-Kamu adalah ahli gizi yang kasih rekomendasi makanan praktis dan realistis.
-Gaya bahasa Jaksel, singkat dan actionable. Fokus ke makanan yang MUDAH DIDAPAT di Indonesia.
-
-DATA USER:
-- Berat: ${user.weight_kg} kg | Target: ${user.target_weight ? user.target_weight + ' kg' : 'belum diset'}
-- Sisa kalori hari ini: ${Math.round(remaining)} kkal
-- Sisa protein yang dibutuhkan: ~${Math.round(remainingProt)}g
-- Udah makan: ${mealCount}x hari ini
-- Waktu sekarang: ${timeOfDay}
-- Makanan terakhir: ${lastFood.food_description} (${lastFood.calories} kkal)
-
-TUGASMU:
-Rekomendasikan 2-3 pilihan makanan untuk makan berikutnya yang:
-1. Kalorinya sesuai dengan sisa budget (${Math.round(remaining)} kkal)
-2. Bantu penuhi kebutuhan nutrisi yang masih kurang
-3. Sesuai waktu (${timeOfDay}) dan mudah didapat di Indonesia
-4. Variatif — jangan rekomendasiin makanan yang sama dengan yang baru dimakan
-
-Format jawaban WAJIB seperti ini (tanpa teks tambahan):
-🍽️ *Rekomendasi Makan ${timeOfDay.charAt(0).toUpperCase() + timeOfDay.slice(1)} Berikutnya:*
-
-1. [nama makanan] (~[kalori] kkal)
-   _[alasan singkat 1 kalimat kenapa ini bagus]_
-
-2. [nama makanan] (~[kalori] kkal)
-   _[alasan singkat]_
-
-3. [nama makanan] (~[kalori] kkal)
-   _[alasan singkat]_
-    `.trim();
-
-    try {
-        const rawText = await callGemini([{
-            role: 'user', parts: [{ text: prompt }]
-        }]);
-        return rawText.trim();
-
-    } catch (err) {
-        console.error('[Gemini] FoodRec error:', err.message);
-        return null; // silent fail — jangan ganggu UX
-    }
-}
-
 module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
-    generateFoodRecommendation,
     generateCoachAnswer,
     downloadImage
 };
