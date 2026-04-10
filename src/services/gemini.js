@@ -1,13 +1,120 @@
 // ============================================================
 // src/services/gemini.js
-// Update: tambah estimateNutritionFromText buat fitur /catat
+// Update: multi API key rotation — otomatis pindah key kalau rate limit
 // ============================================================
 
 const { GoogleGenAI } = require('@google/genai');
 const axios = require('axios');
 require('dotenv').config();
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ─── API KEY ROTATION SETUP ───────────────────────────────────
+
+/**
+ * Kumpulkan semua API key dari .env
+ * Support format: GEMINI_API_KEY_1, GEMINI_API_KEY_2, dst
+ * Fallback ke GEMINI_API_KEY kalau format lama masih dipakai
+ */
+function loadApiKeys() {
+    const keys = [];
+
+    // Coba baca GEMINI_API_KEY_1, _2, _3, ... sampai _10
+    for (let i = 1; i <= 10; i++) {
+        const key = process.env[`GEMINI_API_KEY_${i}`];
+        if (key) keys.push(key);
+    }
+
+    // Fallback: kalau gak ada format numbered, pakai GEMINI_API_KEY biasa
+    if (keys.length === 0 && process.env.GEMINI_API_KEY) {
+        keys.push(process.env.GEMINI_API_KEY);
+    }
+
+    if (keys.length === 0) {
+        throw new Error('Tidak ada Gemini API key ditemukan di .env!');
+    }
+
+    console.log(`[Gemini] ${keys.length} API key loaded`);
+    return keys;
+}
+
+const API_KEYS     = loadApiKeys();
+let currentKeyIdx  = 0; // index key yang sedang aktif
+
+/**
+ * Ambil Gemini client yang aktif sekarang
+ */
+function getClient() {
+    return new GoogleGenAI({ apiKey: API_KEYS[currentKeyIdx] });
+}
+
+/**
+ * Rotate ke key berikutnya
+ * Dipanggil otomatis kalau kena rate limit
+ * @returns {boolean} true kalau masih ada key lain, false kalau semua sudah dicoba
+ */
+function rotateKey() {
+    const nextIdx = (currentKeyIdx + 1) % API_KEYS.length;
+
+    // Kalau udah balik ke key pertama = semua key sudah dicoba
+    if (nextIdx === 0 && currentKeyIdx !== 0) {
+        console.warn('[Gemini] Semua API key kena rate limit!');
+        currentKeyIdx = 0; // reset ke awal buat request berikutnya
+        return false;
+    }
+
+    console.log(`[Gemini] Rate limit — rotate ke key ${nextIdx + 1}/${API_KEYS.length}`);
+    currentKeyIdx = nextIdx;
+    return true;
+}
+
+/**
+ * Wrapper utama: panggil Gemini dengan auto-retry ke key berikutnya kalau rate limit
+ * Semua fungsi di bawah pakai ini — DRY & konsisten
+ *
+ * @param {Array} contents - Gemini contents array
+ * @returns {string} response text dari Gemini
+ */
+async function callGemini(contents) {
+    const triedKeys = new Set(); // track key yang sudah dicoba
+
+    while (triedKeys.size < API_KEYS.length) {
+        triedKeys.add(currentKeyIdx);
+
+        try {
+            const client   = getClient();
+            const response = await client.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents
+            });
+            return response.text; // sukses → return langsung
+
+        } catch (err) {
+            const isRateLimit = err.status === 429
+                || err.message?.includes('429')
+                || err.message?.includes('quota')
+                || err.message?.includes('RATE_LIMIT');
+
+            if (isRateLimit) {
+                // Coba rotate ke key berikutnya
+                const hasMore = rotateKey();
+
+                if (!hasMore || triedKeys.has(currentKeyIdx)) {
+                    // Semua key sudah dicoba dan kena rate limit semua
+                    throw new Error('RATE_LIMIT');
+                }
+                // Lanjut loop — coba dengan key baru
+                continue;
+            }
+
+            // Error bukan rate limit — langsung throw
+            if (err.message?.includes('SAFETY'))  throw new Error('SAFETY_BLOCK');
+            if (err.message === 'PARSE_ERROR')     throw new Error('PARSE_ERROR');
+            console.error('[Gemini] Error:', err.message);
+            throw new Error('GEMINI_ERROR');
+        }
+    }
+
+    throw new Error('RATE_LIMIT'); // fallback kalau somehow keluar loop
+}
 
 // ─── DOWNLOAD IMAGE ───────────────────────────────────────────
 
@@ -45,18 +152,16 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
     try {
         const base64Image = imageBuffer.toString('base64');
 
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{
-                role: 'user',
-                parts: [
-                    { text: prompt },
-                    { inlineData: { mimeType, data: base64Image } }
-                ]
-            }]
-        });
+        // Pakai callGemini wrapper — auto rotate key kalau rate limit
+        const rawText = await callGemini([{
+            role: 'user',
+            parts: [
+                { text: prompt },
+                { inlineData: { mimeType, data: base64Image } }
+            ]
+        }]);
 
-        return parseNutritionResponse(response.text);
+        return parseNutritionResponse(rawText);
 
     } catch (err) {
         handleGeminiError(err);
@@ -100,15 +205,12 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
     `.trim();
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{
-                role: 'user',
-                parts: [{ text: prompt }]  // text only, no image
-            }]
-        });
+        const rawText = await callGemini([{
+            role: 'user',
+            parts: [{ text: prompt }]
+        }]);
 
-        return parseNutritionResponse(response.text);
+        return parseNutritionResponse(rawText);
 
     } catch (err) {
         handleGeminiError(err);
@@ -249,16 +351,14 @@ Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
     `.trim();
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-
-        return response.text.trim();
+        const rawText = await callGemini([{
+            role: 'user', parts: [{ text: prompt }]
+        }]);
+        return rawText.trim();
 
     } catch (err) {
         console.error('[Gemini] CoachAnswer error:', err.message);
-        if (err.status === 429 || err.message?.includes('429')) throw new Error('RATE_LIMIT');
+        if (err.message === 'RATE_LIMIT') throw new Error('RATE_LIMIT');
         throw new Error('GEMINI_ERROR');
     }
 }
@@ -314,12 +414,10 @@ Format jawaban WAJIB seperti ini (tanpa teks tambahan):
     `.trim();
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-
-        return response.text.trim();
+        const rawText = await callGemini([{
+            role: 'user', parts: [{ text: prompt }]
+        }]);
+        return rawText.trim();
 
     } catch (err) {
         console.error('[Gemini] FoodRec error:', err.message);
