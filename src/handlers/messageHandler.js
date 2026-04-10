@@ -826,6 +826,17 @@ async function handleCallbackQuery(ctx) {
             `📊 *Progress Hari Ini:*\n${remainingText}`,
             { parse_mode: 'Markdown' }
         );
+
+        // Kirim coaching + food recommendation sama kayak habis foto/catat
+        // Format menu jadi object yang kompatibel dengan generateAndSendCoaching
+        const menuAsFood = {
+            food_description: menu.food_description,
+            calories:         menu.calories,
+            protein_g:        menu.protein_g,
+            carbs_g:          menu.carbs_g,
+            fat_g:            menu.fat_g
+        };
+        generateAndSendCoaching(ctx, tgId, user, summary, menuAsFood);
         return;
     }
 
