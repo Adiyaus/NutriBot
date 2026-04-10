@@ -181,110 +181,6 @@ function handleGeminiError(err) {
  * @param {object} lastFood - makanan yang baru saja di-log
  * @returns {string} pesan coaching singkat dari "coach"
  */
-async function generateDailyCoaching(user, todaySummary, lastFood) {
-    const remaining  = user.daily_calorie_goal - (todaySummary.total_calories || 0);
-    const timeOfDay  = getTimeOfDay(); // pagi/siang/sore/malam
-
-    const prompt = `
-Kamu adalah coach diet yang friendly, supportif, dan to-the-point. Gaya bahasa lo campuran Indonesia-Inggris (Jaksel style), casual tapi tetap informatif. JANGAN terlalu panjang.
-
-DATA USER:
-- Nama: ${user.name}
-- Berat: ${user.weight_kg} kg, Target: ${user.target_weight ? user.target_weight + ' kg' : 'belum diset'}
-- Target kalori harian: ${Math.round(user.daily_calorie_goal)} kkal
-- Waktu sekarang: ${timeOfDay}
-
-MAKANAN YANG BARU DIMAKAN:
-- ${lastFood.food_description}
-- Kalori: ${lastFood.calories} kkal | Protein: ${lastFood.protein_g}g | Karbo: ${lastFood.carbs_g}g | Lemak: ${lastFood.fat_g}g
-
-PROGRESS HARI INI (setelah makan ini):
-- Total kalori: ${Math.round(todaySummary.total_calories)} / ${Math.round(user.daily_calorie_goal)} kkal
-- Sisa kalori: ${Math.round(remaining)} kkal
-- Sudah makan: ${todaySummary.meal_count}x
-- Total protein hari ini: ${(todaySummary.total_protein || 0).toFixed(1)}g
-
-TUGASMU:
-Berikan coaching insight yang SINGKAT (max 3 kalimat) dan RELEVAN berdasarkan situasi di atas.
-Fokus pada 1 insight terpenting saja — jangan kasih semua sekaligus.
-Bisa komentar soal: pilihan makanan, timing makan, sisa kalori, protein intake, atau motivasi.
-Kalau user over kalori, tetap supportif — jangan judgmental.
-Kalau makanannya sehat/bagus, pujilah dengan tulus.
-
-Balas HANYA teks coaching-nya saja, tanpa formatting markdown, tanpa emoji berlebihan (max 2 emoji).
-    `.trim();
-
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-
-        return response.text.trim();
-
-    } catch (err) {
-        console.error('[Gemini] Coaching error:', err.message);
-        return null; // return null kalau gagal — handler akan skip coaching
-    }
-}
-
-/**
- * Generate weekly coaching summary
- * Dipanggil tiap Senin pagi oleh cron job
- *
- * @param {object} user - data profil user
- * @param {Array} weeklyLogs - array food logs 7 hari terakhir
- * @param {number} avgCalories - rata-rata kalori per hari
- * @param {number} daysLogged - berapa hari yang ada log-nya
- * @returns {string} weekly insight dari coach
- */
-async function generateWeeklyCoaching(user, weeklyLogs, avgCalories, daysLogged) {
-    // Hitung total dan rata-rata nutrisi minggu ini
-    const totalProtein = weeklyLogs.reduce((s, l) => s + Number(l.protein_g || 0), 0);
-    const avgProtein   = daysLogged > 0 ? (totalProtein / daysLogged).toFixed(1) : 0;
-    const caloriesDiff = avgCalories - user.daily_calorie_goal;
-
-    const prompt = `
-Kamu adalah coach diet mingguan yang analitis tapi tetap supportif. Gaya bahasa Jaksel, casual, max 5 kalimat.
-
-DATA USER:
-- Nama: ${user.name}
-- Berat saat ini: ${user.weight_kg} kg
-- Target berat: ${user.target_weight ? user.target_weight + ' kg' : 'belum diset'}
-- Target kalori harian: ${Math.round(user.daily_calorie_goal)} kkal
-
-RINGKASAN MINGGU INI:
-- Hari yang ke-log: ${daysLogged}/7 hari
-- Rata-rata kalori/hari: ${Math.round(avgCalories)} kkal
-- Selisih dari target: ${caloriesDiff > 0 ? '+' : ''}${Math.round(caloriesDiff)} kkal/hari
-- Rata-rata protein/hari: ${avgProtein}g
-
-TUGASMU:
-Berikan weekly insight yang mencakup:
-1. Evaluasi singkat minggu ini (jujur tapi supportif)
-2. 1-2 saran konkret buat minggu depan
-3. Kalimat penutup yang motivating
-
-Kalau daysLogged < 4, fokus ke konsistensi dulu.
-Kalau avgCalories jauh di atas target, kasih saran praktis.
-Kalau sudah bagus, apresiasi dan kasih tantangan kecil.
-
-Balas HANYA teks coaching-nya, tanpa formatting markdown.
-    `.trim();
-
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-
-        return response.text.trim();
-
-    } catch (err) {
-        console.error('[Gemini] Weekly coaching error:', err.message);
-        return null;
-    }
-}
 
 // ─── HELPER ───────────────────────────────────────────────────
 
@@ -434,9 +330,7 @@ Format jawaban WAJIB seperti ini (tanpa teks tambahan):
 module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
-    generateDailyCoaching,
-    generateWeeklyCoaching,
-    generateCoachAnswer,
     generateFoodRecommendation,
+    generateCoachAnswer,
     downloadImage
 };

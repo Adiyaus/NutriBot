@@ -1099,27 +1099,13 @@ async function handleTanya(ctx) {
 // ─── COACHING HELPER ─────────────────────────────────────────
 
 /**
- * Generate dan kirim coaching + food recommendation setelah log makan
- * Dipanggil secara fire-and-forget biar gak delay response utama
- * Coaching & recommendation di-generate paralel → lebih cepat
+ * Generate dan kirim food recommendation setelah log makan
+ * Daily coaching dihapus buat hemat Gemini API quota
  */
 async function generateAndSendCoaching(ctx, tgId, user, todaySummary, lastFood) {
     try {
-        // Generate coaching + recommendation secara paralel (lebih cepat)
-        const [coaching, recommendation] = await Promise.all([
-            gemini.generateDailyCoaching(user, todaySummary, lastFood),
-            gemini.generateFoodRecommendation(user, todaySummary, lastFood)
-        ]);
+        const recommendation = await gemini.generateFoodRecommendation(user, todaySummary, lastFood);
 
-        // Kirim coaching dulu kalau ada
-        if (coaching) {
-            await ctx.telegram.sendMessage(tgId,
-                `💬 *Coach says:*\n\n${coaching}`,
-                { parse_mode: 'Markdown' }
-            );
-        }
-
-        // Kirim food recommendation sebagai pesan terpisah
         if (recommendation) {
             await ctx.telegram.sendMessage(tgId,
                 recommendation,
@@ -1128,7 +1114,7 @@ async function generateAndSendCoaching(ctx, tgId, user, todaySummary, lastFood) 
         }
 
     } catch (err) {
-        console.error('[Coaching] Failed to send:', err.message);
+        console.error('[FoodRec] Failed to send:', err.message);
     }
 }
 
