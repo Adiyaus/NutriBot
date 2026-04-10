@@ -11,6 +11,8 @@ const lastLogIdMap    = new Map(); // last log ID per user (buat /adjust)
 const lastResultMap   = new Map(); // last Gemini result per user (buat simpan menu)
 const adjustModeMap   = new Map(); // user lagi di mode adjust
 const saveMenuModeMap = new Map(); // user lagi di mode input nama menu
+const inputModeMap    = new Map(); // user lagi di mode input manual nutrisi
+// inputModeMap value: { step, name, calories, protein_g, carbs_g, fat_g }
 
 async function reply(ctx, text, extra = {}) {
     return ctx.reply(text, { parse_mode: 'Markdown', ...extra });
@@ -57,6 +59,7 @@ async function handleHelp(ctx) {
         `*/remind [HH:MM]* — set reminder harian\n` +
         `*/menu* — lihat & pilih menu tersimpan\n` +
         `*/catat [makanan]* — log makanan tanpa foto\n` +
+        `*/input* — input nutrisi manual (template)\n` +
         `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
         `*/profil* — lihat & update data profil\n` +
         `*/reset* — hapus semua log hari ini\n` +
@@ -527,6 +530,12 @@ async function handleText(ctx) {
     const body = ctx.message.text?.trim() || '';
     const user = await db.getUser(tgId);
 
+    // ── Mode: input manual nutrisi ───────────────────────────
+    if (inputModeMap.has(tgId)) {
+        await handleInputStep(ctx, tgId, body);
+        return;
+    }
+
     // ── Mode: input nama menu buat disimpan ──────────────────
     if (saveMenuModeMap.has(tgId)) {
         await handleSaveMenuInput(ctx, tgId, body);
@@ -543,6 +552,7 @@ async function handleText(ctx) {
     if (body.toLowerCase() === '/batal' || body.toLowerCase() === 'batal') {
         adjustModeMap.delete(tgId);
         saveMenuModeMap.delete(tgId);
+        inputModeMap.delete(tgId);
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
     }
@@ -999,17 +1009,173 @@ async function handlePhoto(ctx) {
     }
 }
 
-// ─── NEW: TANYA COACH ─────────────────────────────────────────
+// ─── NEW: INPUT MANUAL NUTRISI ───────────────────────────────
 
 /**
- * /tanya [pertanyaan] — tanya jawab personal dengan AI coach
- *
- * Contoh:
- *   /tanya apakah nasi merah lebih bagus dari nasi putih buat diet?
- *   /tanya olahraga apa yang cocok buat berat badan aku sekarang?
- *   /tanya kenapa aku lapar terus padahal udah makan?
- *   /tanya berapa gram protein yang aku butuhkan per hari?
+ * /input — input makanan manual dengan template nutrisi
+ * Bot tanya step by step: nama → kalori → protein → karbo → lemak
+ * Cocok kalau user tau data nutrisinya (dari kemasan, dll)
  */
+async function handleInput(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! 😅 Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    // Mulai state machine input manual
+    inputModeMap.set(tgId, { step: 'ask_name' });
+
+    await reply(ctx,
+        `📝 *Input Nutrisi Manual*\n\n` +
+        `Gua bakal tanya satu-satu ya. Ketik /batal buat cancel.\n\n` +
+        `*Nama makanannya apa?*\n` +
+        `_(contoh: Nasi Padang, Mie Goreng Indomie, Roti Gandum)_`
+    );
+}
+
+/**
+ * Handle setiap step input manual — dipanggil dari handleText
+ * State machine: ask_name → ask_calories → ask_protein → ask_carbs → ask_fat → done
+ */
+async function handleInputStep(ctx, tgId, body) {
+    const state = inputModeMap.get(tgId);
+    if (!state) return;
+
+    const user = await db.getUser(tgId);
+
+    switch (state.step) {
+
+        case 'ask_name': {
+            if (body.length < 2 || body.length > 100) {
+                await reply(ctx, `Nama makanan harus 2-100 karakter. Coba lagi!`);
+                return;
+            }
+            // Simpan nama, lanjut ke step kalori
+            inputModeMap.set(tgId, { ...state, step: 'ask_calories', name: body });
+            await reply(ctx,
+                `Oke, *"${body}"* ✅\n\n` +
+                `*Kalorinya berapa? (kkal)*\n` +
+                `_(ketik angkanya aja, contoh: 450)_\n` +
+                `_Gak tau? Ketik 0_`
+            );
+            break;
+        }
+
+        case 'ask_calories': {
+            const calories = parseFloat(body);
+            if (isNaN(calories) || calories < 0 || calories > 5000) {
+                await reply(ctx, `Kalori harus angka 0-5000. Coba lagi!`);
+                return;
+            }
+            inputModeMap.set(tgId, { ...state, step: 'ask_protein', calories });
+            await reply(ctx,
+                `*Protein berapa gram?*\n` +
+                `_(contoh: 25.5)_\n` +
+                `_Gak tau? Ketik 0_`
+            );
+            break;
+        }
+
+        case 'ask_protein': {
+            const protein = parseFloat(body);
+            if (isNaN(protein) || protein < 0 || protein > 500) {
+                await reply(ctx, `Protein harus angka 0-500 gram. Coba lagi!`);
+                return;
+            }
+            inputModeMap.set(tgId, { ...state, step: 'ask_carbs', protein_g: protein });
+            await reply(ctx,
+                `*Karbohidrat berapa gram?*\n` +
+                `_(contoh: 60)_\n` +
+                `_Gak tau? Ketik 0_`
+            );
+            break;
+        }
+
+        case 'ask_carbs': {
+            const carbs = parseFloat(body);
+            if (isNaN(carbs) || carbs < 0 || carbs > 1000) {
+                await reply(ctx, `Karbo harus angka 0-1000 gram. Coba lagi!`);
+                return;
+            }
+            inputModeMap.set(tgId, { ...state, step: 'ask_fat', carbs_g: carbs });
+            await reply(ctx,
+                `*Lemak berapa gram?*\n` +
+                `_(contoh: 15)_\n` +
+                `_Gak tau? Ketik 0_`
+            );
+            break;
+        }
+
+        case 'ask_fat': {
+            const fat = parseFloat(body);
+            if (isNaN(fat) || fat < 0 || fat > 500) {
+                await reply(ctx, `Lemak harus angka 0-500 gram. Coba lagi!`);
+                return;
+            }
+
+            // Semua data terkumpul — simpan ke food_logs
+            const finalData = {
+                food_description: state.name,
+                calories:         state.calories,
+                protein_g:        state.protein_g,
+                carbs_g:          state.carbs_g,
+                fat_g:            fat
+            };
+
+            // Hapus dari state map dulu sebelum DB call
+            inputModeMap.delete(tgId);
+
+            try {
+                const savedLog = await db.insertFoodLog(tgId, finalData);
+
+                // Simpan ke memory buat /adjust dan save menu
+                lastLogIdMap.set(tgId, savedLog.id);
+                lastResultMap.set(tgId, finalData);
+
+                // Hitung progress hari ini
+                const summary   = await db.getDailySummary(tgId);
+                const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
+
+                const statusEmoji   = remaining > 0 ? '✅' : '🚨';
+                const remainingText = remaining > 0
+                    ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
+                    : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+
+                await reply(ctx,
+                    `${statusEmoji} *Makanan Tercatat!*\n\n` +
+                    `🍽️ *${finalData.food_description}*\n\n` +
+                    `🔥 Kalori: *${finalData.calories} kkal*\n` +
+                    `💪 Protein: *${finalData.protein_g}g*\n` +
+                    `🍚 Karbo: *${finalData.carbs_g}g*\n` +
+                    `🥑 Lemak: *${finalData.fat_g}g*\n\n` +
+                    `_Input manual — data dari lo sendiri_ ✍️\n\n` +
+                    `━━━━━━━━━━━━━━\n` +
+                    `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
+                    `${remainingText}`,
+                    {
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
+                                { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }
+                            ]]
+                        }
+                    }
+                );
+
+            } catch (err) {
+                console.error(`[InputHandler] DB error for ${tgId}:`, err.message);
+                await reply(ctx, `😵 Gagal nyimpen. Coba lagi ya!`);
+            }
+            break;
+        }
+    }
+}
+
+// ─── NEW: TANYA COACH ─────────────────────────────────────────
+
 async function handleTanya(ctx) {
     const tgId = ctx.from.id;
     const user = await db.getUser(tgId);
@@ -1141,6 +1307,6 @@ module.exports = {
     handleStart, handleHelp, handleStatus, handleLaporan,
     handleProfil, handleReset, handleAdjust,
     handleStreak, handleTarget, handleRemind,
-    handleMenu, handleCatat, handleTanya,
+    handleMenu, handleCatat, handleInput, handleTanya,
     handleText, handleCallbackQuery, handlePhoto
 };
