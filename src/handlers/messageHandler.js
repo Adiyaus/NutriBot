@@ -517,6 +517,12 @@ async function handleCatat(ctx) {
         return;
     }
 
+    // Clear semua mode yang mungkin aktif — biar gak ada konflik state
+    inputModeMap.delete(tgId);
+    editModeMap.delete(tgId);
+    adjustModeMap.delete(tgId);
+    saveMenuModeMap.delete(tgId);
+
     // Ambil teks setelah "/catat "
     const fullText  = ctx.message.text || '';
     const foodInput = fullText.replace(/^\/catat\s*/i, '').trim();
@@ -1070,7 +1076,14 @@ async function handleCallbackQuery(ctx) {
 
     // ── Simpan ke menu (setelah analisis foto) ───────────────
     if (data === 'save_to_menu') {
-        saveMenuModeMap.set(tgId, true); // aktifkan save menu mode
+        // Clear semua mode lain dulu biar gak ada konflik
+        // Ini root cause bug: inputModeMap yang masih ke-set dari /input sebelumnya
+        // bikin teks nama menu salah masuk ke handleInputStep
+        inputModeMap.delete(tgId);
+        editModeMap.delete(tgId);
+        adjustModeMap.delete(tgId);
+
+        saveMenuModeMap.set(tgId, true);
         await ctx.editMessageText(
             ctx.callbackQuery.message.text + '\n\n✏️ _Ketik nama untuk menu ini:_',
             { parse_mode: 'Markdown' }
@@ -1213,9 +1226,11 @@ async function handlePhoto(ctx) {
         return;
     }
 
-    // Clear mode apapun yang aktif
+    // Clear semua mode yang aktif — konsisten dengan handleCatat
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
+    inputModeMap.delete(tgId);
+    editModeMap.delete(tgId);
 
     const loadingMsg = await reply(ctx, `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`);
 
