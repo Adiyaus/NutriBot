@@ -174,6 +174,45 @@ async function updateFoodLogDescription(logId, newDescription) {
     if (error) throw new Error('Gagal update food log');
 }
 
+/**
+ * Update semua field nutrisi di log tertentu
+ * Dipake buat fitur edit angka kalori/protein/karbo/lemak
+ * @param {number} logId
+ * @param {number} telegramId - validasi ownership
+ * @param {object} updates - { food_description, calories, protein_g, carbs_g, fat_g }
+ */
+async function updateFoodLog(logId, telegramId, updates) {
+    const { error } = await supabase
+        .from('food_logs')
+        .update(updates)
+        .eq('id', logId)
+        .eq('telegram_id', telegramId); // pastiin log ini milik user yang beneran
+
+    if (error) {
+        console.error('[DB] updateFoodLog error:', error.message);
+        throw new Error('Gagal update food log');
+    }
+}
+
+/**
+ * Hapus 1 log spesifik by ID
+ * Dipake buat fitur /hapus log tertentu (bukan semua)
+ * @param {number} logId
+ * @param {number} telegramId - validasi ownership
+ */
+async function deleteLogById(logId, telegramId) {
+    const { error } = await supabase
+        .from('food_logs')
+        .delete()
+        .eq('id', logId)
+        .eq('telegram_id', telegramId); // hanya bisa hapus log milik sendiri
+
+    if (error) {
+        console.error('[DB] deleteLogById error:', error.message);
+        throw new Error('Gagal hapus log');
+    }
+}
+
 async function deleteTodayLogs(telegramId) {
     const today = getTodayWIB();
     const { data, error } = await supabase
@@ -358,7 +397,8 @@ module.exports = {
     // streak, target, reminder
     getStreak, setTargetWeight, setReminderTime, getUsersWithReminder,
     // food logs
-    insertFoodLog, updateFoodLogDescription, deleteTodayLogs,
+    insertFoodLog, updateFoodLogDescription, updateFoodLog,
+    deleteLogById, deleteTodayLogs,
     getDailySummary, getTodayFoodList, getWeeklyLogs,
     // saved menus
     saveMenu, getSavedMenus, getSavedMenuById,

@@ -9,7 +9,9 @@ const calc   = require('../utils/calculator');
 
 const lastLogIdMap    = new Map(); // last log ID per user (buat /adjust)
 const lastResultMap   = new Map(); // last Gemini result per user (buat simpan menu)
-const adjustModeMap   = new Map(); // user lagi di mode adjust
+const adjustModeMap   = new Map(); // user lagi di mode adjust deskripsi
+const editModeMap     = new Map(); // user lagi di mode edit angka nutrisi
+// editModeMap value: { logId, step, food_description, calories, protein_g, carbs_g, fat_g }
 const saveMenuModeMap = new Map(); // user lagi di mode input nama menu
 const inputModeMap    = new Map(); // user lagi di mode input manual nutrisi
 // inputModeMap value: { step, name, calories, protein_g, carbs_g, fat_g }
@@ -63,7 +65,8 @@ async function handleHelp(ctx) {
         `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
         `*/profil* — lihat & update data profil\n` +
         `*/reset* — hapus semua log hari ini\n` +
-        `*/adjust* — koreksi hasil analisis terakhir\n` +
+        `*/hapus* — hapus 1 log spesifik hari ini\n` +
+        `*/adjust* — koreksi log terakhir (nama/angka)\n` +
         `*/help* — tampilkan menu ini\n\n` +
         `📸 *Kirim foto makanan* → auto analisis + opsi simpan ke menu!\n\n` +
         `_Powered by Gemini 2.5 Flash_ 🤖`
@@ -186,10 +189,93 @@ async function handleReset(ctx) {
     );
 }
 
+async function handleReset(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    const summary = await db.getDailySummary(tgId);
+
+    if (!summary.meal_count || summary.meal_count === 0) {
+        await reply(ctx, `📭 Belum ada log makanan hari ini!`);
+        return;
+    }
+
+    await reply(ctx,
+        `⚠️ *Yakin mau reset log hari ini?*\n\n` +
+        `• ${summary.meal_count}x log makanan\n` +
+        `• Total ${Math.round(summary.total_calories)} kkal\n\n` +
+        `_Aksi ini gak bisa di-undo!_`,
+        {
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '✅ Ya, Reset!', callback_data: 'confirm_reset' },
+                    { text: '❌ Batalin',    callback_data: 'cancel_reset'  }
+                ]]
+            }
+        }
+    );
+}
+
+/**
+ * /hapus — hapus 1 log spesifik hari ini
+ * Tampilkan list log hari ini → user pilih mana yang mau dihapus
+ */
+async function handleHapus(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    const foodList = await db.getTodayFoodList(tgId);
+
+    if (!foodList || foodList.length === 0) {
+        await reply(ctx, `📭 Belum ada log makanan hari ini yang bisa dihapus!`);
+        return;
+    }
+
+    // Build inline keyboard — tiap log jadi 1 tombol
+    const buttons = foodList.map(food => {
+        // Truncate nama biar muat di tombol
+        const name = food.food_description.length > 30
+            ? food.food_description.substring(0, 30) + '...'
+            : food.food_description;
+
+        // Format jam WIB dari logged_at
+        const loggedAt = new Date(food.logged_at);
+        const wibHour  = String((loggedAt.getUTCHours() + 7) % 24).padStart(2, '0');
+        const wibMin   = String(loggedAt.getUTCMinutes()).padStart(2, '0');
+
+        return [{
+            text: `🗑️ ${wibHour}:${wibMin} — ${name} (${Math.round(food.calories)} kkal)`,
+            callback_data: `hapus_log_${food.id}`
+        }];
+    });
+
+    buttons.push([{ text: '❌ Batalin', callback_data: 'cancel_hapus' }]);
+
+    await ctx.reply(
+        `🗑️ *Pilih log yang mau dihapus:*\n\n` +
+        `_Hari ini ada ${foodList.length} log makanan_`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: buttons }
+        }
+    );
+}
+
 async function handleAdjust(ctx) {
     const tgId      = ctx.from.id;
     const user      = await db.getUser(tgId);
     const lastLogId = lastLogIdMap.get(tgId);
+    const lastResult = lastResultMap.get(tgId);
 
     if (!user?.is_registered) {
         await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
@@ -197,16 +283,29 @@ async function handleAdjust(ctx) {
     }
 
     if (!lastLogId) {
-        await reply(ctx, `Belum ada analisis terakhir nih. Kirim foto dulu ya! 📸`);
+        await reply(ctx, `Belum ada log terakhir nih. Kirim foto, /catat, atau /input dulu ya! 📸`);
         return;
     }
 
-    adjustModeMap.set(tgId, lastLogId);
-    await reply(ctx,
-        `✏️ *Mode Koreksi Aktif*\n\n` +
-        `Ketik deskripsi makanan yang bener:\n\n` +
-        `_Contoh: "nasi putih 1 porsi, ayam goreng 1 potong"_\n\n` +
-        `Atau /batal buat cancel`
+    // Tampilkan data log terakhir + 2 opsi edit via inline keyboard
+    await ctx.reply(
+        `✏️ *Koreksi Log Terakhir:*\n\n` +
+        `🍽️ ${lastResult?.food_description || 'Makanan'}\n` +
+        `🔥 ${lastResult?.calories || 0} kkal • ` +
+        `💪 ${lastResult?.protein_g || 0}g • ` +
+        `🍚 ${lastResult?.carbs_g || 0}g • ` +
+        `🥑 ${lastResult?.fat_g || 0}g\n\n` +
+        `Mau koreksi yang mana?`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '📝 Edit Nama/Deskripsi', callback_data: 'edit_desc'    }],
+                    [{ text: '🔢 Edit Angka Nutrisi',  callback_data: 'edit_numbers' }],
+                    [{ text: '❌ Batalin',              callback_data: 'cancel_edit'  }]
+                ]
+            }
+        }
     );
 }
 
@@ -536,6 +635,12 @@ async function handleText(ctx) {
         return;
     }
 
+    // ── Mode: edit angka nutrisi ─────────────────────────────
+    if (editModeMap.has(tgId)) {
+        await handleEditStep(ctx, tgId, body);
+        return;
+    }
+
     // ── Mode: input nama menu buat disimpan ──────────────────
     if (saveMenuModeMap.has(tgId)) {
         await handleSaveMenuInput(ctx, tgId, body);
@@ -553,6 +658,7 @@ async function handleText(ctx) {
         adjustModeMap.delete(tgId);
         saveMenuModeMap.delete(tgId);
         inputModeMap.delete(tgId);
+        editModeMap.delete(tgId);
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
     }
@@ -630,12 +736,120 @@ async function handleAdjustInput(ctx, tgId, newDescription) {
     try {
         await db.updateFoodLogDescription(logId, newDescription);
         adjustModeMap.delete(tgId);
+
+        // Update lastResult juga biar konsisten
+        const lastResult = lastResultMap.get(tgId);
+        if (lastResult) lastResultMap.set(tgId, { ...lastResult, food_description: newDescription });
+
         await reply(ctx,
-            `✅ *Deskripsi berhasil diupdate!*\n\n🍽️ *${newDescription}*\n\n` +
-            `_Kalori & nutrisi tetap dari estimasi awal Gemini ya._`
+            `✅ *Deskripsi berhasil diupdate!*\n\n🍽️ *${newDescription}*`
         );
     } catch {
         await reply(ctx, `😵 Gagal update. Coba lagi ya!`);
+    }
+}
+
+/**
+ * Handle step-by-step edit angka nutrisi
+ * State machine: ask_calories → ask_protein → ask_carbs → ask_fat → done
+ */
+async function handleEditStep(ctx, tgId, body) {
+    const state = editModeMap.get(tgId);
+    if (!state) return;
+
+    const user = await db.getUser(tgId);
+
+    switch (state.step) {
+
+        case 'ask_calories': {
+            const val = parseFloat(body);
+            if (isNaN(val) || val < 0 || val > 5000) {
+                await reply(ctx, `Kalori harus angka 0-5000. Coba lagi!`);
+                return;
+            }
+            editModeMap.set(tgId, { ...state, step: 'ask_protein', calories: val });
+            await reply(ctx,
+                `🔥 Kalori: *${val} kkal* ✅\n\n` +
+                `*Protein berapa gram?*\n_(ketik angka baru, atau ketik sama kayak sebelumnya: ${state.protein_g}g)_`
+            );
+            break;
+        }
+
+        case 'ask_protein': {
+            const val = parseFloat(body);
+            if (isNaN(val) || val < 0 || val > 500) {
+                await reply(ctx, `Protein harus angka 0-500. Coba lagi!`);
+                return;
+            }
+            editModeMap.set(tgId, { ...state, step: 'ask_carbs', protein_g: val });
+            await reply(ctx,
+                `💪 Protein: *${val}g* ✅\n\n` +
+                `*Karbohidrat berapa gram?*\n_(sebelumnya: ${state.carbs_g}g)_`
+            );
+            break;
+        }
+
+        case 'ask_carbs': {
+            const val = parseFloat(body);
+            if (isNaN(val) || val < 0 || val > 1000) {
+                await reply(ctx, `Karbo harus angka 0-1000. Coba lagi!`);
+                return;
+            }
+            editModeMap.set(tgId, { ...state, step: 'ask_fat', carbs_g: val });
+            await reply(ctx,
+                `🍚 Karbo: *${val}g* ✅\n\n` +
+                `*Lemak berapa gram?*\n_(sebelumnya: ${state.fat_g}g)_`
+            );
+            break;
+        }
+
+        case 'ask_fat': {
+            const val = parseFloat(body);
+            if (isNaN(val) || val < 0 || val > 500) {
+                await reply(ctx, `Lemak harus angka 0-500. Coba lagi!`);
+                return;
+            }
+
+            const updates = {
+                calories:  state.calories,
+                protein_g: state.protein_g,
+                carbs_g:   state.carbs_g,
+                fat_g:     val
+            };
+
+            editModeMap.delete(tgId);
+
+            try {
+                await db.updateFoodLog(state.logId, tgId, updates);
+
+                // Update lastResult di memory biar /adjust selanjutnya dapet data terbaru
+                lastResultMap.set(tgId, {
+                    ...lastResultMap.get(tgId),
+                    ...updates
+                });
+
+                // Hitung ulang progress hari ini
+                const summary   = await db.getDailySummary(tgId);
+                const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
+                const remainingText = remaining > 0
+                    ? `Sisa: *${Math.round(remaining)} kkal*`
+                    : `Over *${Math.abs(Math.round(remaining))} kkal* dari target`;
+
+                await reply(ctx,
+                    `✅ *Nutrisi berhasil diupdate!*\n\n` +
+                    `🍽️ *${state.food_description}*\n\n` +
+                    `🔥 Kalori: *${state.calories} kkal*\n` +
+                    `💪 Protein: *${state.protein_g}g*\n` +
+                    `🍚 Karbo: *${state.carbs_g}g*\n` +
+                    `🥑 Lemak: *${val}g*\n\n` +
+                    `📊 ${remainingText} buat hari ini`
+                );
+
+            } catch (err) {
+                await reply(ctx, `😵 Gagal update. Coba lagi ya!`);
+            }
+            break;
+        }
     }
 }
 
@@ -732,6 +946,79 @@ async function handleCallbackQuery(ctx) {
 
     if (data === 'cancel_reset') {
         await ctx.editMessageText(`Oke, log hari ini aman! 👌`);
+        return;
+    }
+
+    // ── Edit deskripsi ───────────────────────────────────────
+    if (data === 'edit_desc') {
+        const lastLogId = lastLogIdMap.get(tgId);
+        adjustModeMap.set(tgId, lastLogId);
+        await ctx.editMessageText(`✏️ Ketik nama/deskripsi makanan yang bener:\n\n_Atau /batal untuk cancel_`, { parse_mode: 'Markdown' });
+        return;
+    }
+
+    // ── Edit angka nutrisi ───────────────────────────────────
+    if (data === 'edit_numbers') {
+        const lastLogId  = lastLogIdMap.get(tgId);
+        const lastResult = lastResultMap.get(tgId);
+
+        // Set state edit dengan data saat ini sebagai default
+        editModeMap.set(tgId, {
+            step:             'ask_calories',
+            logId:            lastLogId,
+            food_description: lastResult?.food_description || '',
+            calories:         lastResult?.calories  || 0,
+            protein_g:        lastResult?.protein_g || 0,
+            carbs_g:          lastResult?.carbs_g   || 0,
+            fat_g:            lastResult?.fat_g     || 0
+        });
+
+        await ctx.editMessageText(
+            `🔢 *Edit Angka Nutrisi*\n\n` +
+            `Gua tanya satu-satu ya. Ketik /batal untuk cancel.\n\n` +
+            `*Kalori berapa kkal?*\n_(sebelumnya: ${lastResult?.calories || 0} kkal)_`,
+            { parse_mode: 'Markdown' }
+        );
+        return;
+    }
+
+    if (data === 'cancel_edit') {
+        adjustModeMap.delete(tgId);
+        editModeMap.delete(tgId);
+        await ctx.editMessageText(`Oke, log gak diubah! 👌`);
+        return;
+    }
+
+    // ── Hapus log spesifik ───────────────────────────────────
+    if (data.startsWith('hapus_log_')) {
+        const logId = parseInt(data.replace('hapus_log_', ''));
+        const user  = await db.getUser(tgId);
+
+        try {
+            await db.deleteLogById(logId, tgId);
+
+            // Kalau yang dihapus adalah last log, clear memory
+            if (lastLogIdMap.get(tgId) === logId) {
+                lastLogIdMap.delete(tgId);
+                lastResultMap.delete(tgId);
+            }
+
+            const summary   = await db.getDailySummary(tgId);
+            const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
+
+            await ctx.editMessageText(
+                `✅ *Log berhasil dihapus!*\n\n` +
+                `📊 Sisa kalori sekarang: *${Math.round(remaining > 0 ? remaining : 0)} kkal*`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (err) {
+            await ctx.editMessageText(`❌ Gagal hapus log. Coba lagi ya!`);
+        }
+        return;
+    }
+
+    if (data === 'cancel_hapus') {
+        await ctx.editMessageText(`Oke, gak jadi hapus! 👌`);
         return;
     }
 
@@ -1303,10 +1590,26 @@ function buildStatusMessage(summary, dailyGoal, foodList = []) {
     );
 }
 
+/**
+ * Reset semua in-memory state harian
+ * Dipanggil tiap tengah malam oleh cron job
+ * Biar /adjust gak nyasar ke log kemarin
+ */
+function resetDailyMemory() {
+    lastLogIdMap.clear();
+    lastResultMap.clear();
+    adjustModeMap.clear();
+    editModeMap.clear();
+    saveMenuModeMap.clear();
+    inputModeMap.clear();
+    console.log('[Memory] Daily reset — semua state map cleared');
+}
+
 module.exports = {
     handleStart, handleHelp, handleStatus, handleLaporan,
-    handleProfil, handleReset, handleAdjust,
+    handleProfil, handleReset, handleHapus, handleAdjust,
     handleStreak, handleTarget, handleRemind,
     handleMenu, handleCatat, handleInput, handleTanya,
-    handleText, handleCallbackQuery, handlePhoto
+    handleText, handleCallbackQuery, handlePhoto,
+    resetDailyMemory
 };

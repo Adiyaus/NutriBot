@@ -1,10 +1,10 @@
 // ============================================================
 // src/services/reminder.js
-// Cron job reminder harian — weekly coaching dihapus (hemat quota)
+// Cron job: daily reminder + auto-reset tengah malam WIB
 // ============================================================
 
-const cron = require('node-cron');
-const db   = require('./database');
+const cron    = require('node-cron');
+const db      = require('./database');
 
 function initReminder(bot) {
 
@@ -60,7 +60,22 @@ function initReminder(bot) {
         }
     });
 
-    console.log('⏰ Reminder cron aktif');
+    // ── Auto-reset memory tengah malam WIB ───────────────────
+    // 00:00 WIB = 17:00 UTC
+    // Data DB gak perlu dihapus — getTodayWIB() otomatis baca tanggal baru
+    // Yang direset cuma in-memory Maps biar /adjust gak nyasar ke log kemarin
+    cron.schedule('0 17 * * *', () => {
+        try {
+            // Import di sini buat avoid circular dependency
+            const { resetDailyMemory } = require('../handlers/messageHandler');
+            resetDailyMemory();
+            console.log('[MidnightReset] 00:00 WIB — memory reset done ✅');
+        } catch (err) {
+            console.error('[MidnightReset] Error:', err.message);
+        }
+    });
+
+    console.log('⏰ Reminder + auto-reset cron aktif');
 }
 
 module.exports = { initReminder };

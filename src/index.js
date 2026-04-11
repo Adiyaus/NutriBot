@@ -5,7 +5,7 @@ const { initReminder } = require('./services/reminder');
 
 const {
     handleStart, handleHelp, handleStatus, handleLaporan,
-    handleProfil, handleReset, handleAdjust,
+    handleProfil, handleReset, handleHapus, handleAdjust,
     handleStreak, handleTarget, handleRemind,
     handleMenu, handleCatat, handleInput, handleTanya,
     handleText, handleCallbackQuery, handlePhoto
@@ -20,6 +20,7 @@ bot.command('status',  handleStatus);
 bot.command('laporan', handleLaporan);
 bot.command('profil',  handleProfil);
 bot.command('reset',   handleReset);
+bot.command('hapus',   handleHapus);
 bot.command('adjust',  handleAdjust);
 bot.command('streak',  handleStreak);
 bot.command('target',  handleTarget);
