@@ -7,17 +7,48 @@ const db     = require('../services/database');
 const gemini = require('../services/gemini');
 const calc   = require('../utils/calculator');
 
-const lastLogIdMap    = new Map(); // last log ID per user (buat /adjust)
-const lastResultMap   = new Map(); // last Gemini result per user (buat simpan menu)
-const adjustModeMap   = new Map(); // user lagi di mode adjust deskripsi
-const editModeMap     = new Map(); // user lagi di mode edit angka nutrisi
-// editModeMap value: { logId, step, food_description, calories, protein_g, carbs_g, fat_g }
-const saveMenuModeMap = new Map(); // user lagi di mode input nama menu
-const inputModeMap    = new Map(); // user lagi di mode input manual nutrisi
-// inputModeMap value: { step, name, calories, protein_g, carbs_g, fat_g }
+const lastLogIdMap    = new Map();
+const lastResultMap   = new Map();
+const adjustModeMap   = new Map();
+const editModeMap     = new Map();
+const saveMenuModeMap = new Map();
+const inputModeMap    = new Map();
+
+// ─── KEYBOARD LAYOUT ─────────────────────────────────────────
+
+/**
+ * Reply keyboard permanen yang nempel di bawah chat
+ * Dibagi per baris sesuai kategori biar rapi
+ */
+const MAIN_KEYBOARD = {
+    reply_markup: {
+        keyboard: [
+            // Baris 1: tracking harian
+            ['📸 Kirim Foto', '/catat', '/input'],
+            // Baris 2: cek status
+            ['/status', '/laporan', '/streak'],
+            // Baris 3: menu & tools
+            ['/menu', '/tanya', '/target'],
+            // Baris 4: setting & misc
+            ['/remind', '/profil', '/help'],
+            // Baris 5: koreksi
+            ['/adjust', '/hapus', '/reset']
+        ],
+        resize_keyboard:   true,  // otomatis sesuaikan ukuran tombol
+        persistent:        true   // keyboard tetap muncul, gak hilang setelah tap
+    }
+};
 
 async function reply(ctx, text, extra = {}) {
-    return ctx.reply(text, { parse_mode: 'Markdown', ...extra });
+    // Merge MAIN_KEYBOARD ke setiap reply — keyboard selalu muncul
+    // Tapi kalau ada inline_keyboard di extra, jangan override reply_markup-nya
+    const hasInlineKeyboard = extra?.reply_markup?.inline_keyboard;
+
+    const mergedExtra = hasInlineKeyboard
+        ? { parse_mode: 'Markdown', ...extra }                          // pakai inline keyboard dari caller
+        : { parse_mode: 'Markdown', ...MAIN_KEYBOARD, ...extra };       // inject main keyboard
+
+    return ctx.reply(text, mergedExtra);
 }
 
 // ─── COMMAND HANDLERS ────────────────────────────────────────
