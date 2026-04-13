@@ -579,9 +579,10 @@ async function handleCatat(ctx) {
         return;
     }
 
-    // Kirim loading message
-    const loadingMsg = await reply(ctx,
-        `Sebentar ya... 🔍\n_Gemini lagi estimasi nutrisi "${foodInput}"..._`
+    // Kirim loading message TANPA keyboard — biar bisa di-edit setelah Gemini selesai
+    const loadingMsg = await ctx.reply(
+        `Sebentar ya... 🔍\n_Gemini lagi estimasi nutrisi "${foodInput}"..._`,
+        { parse_mode: 'Markdown' }
     );
 
     try {
@@ -1263,7 +1264,11 @@ async function handlePhoto(ctx) {
     inputModeMap.delete(tgId);
     editModeMap.delete(tgId);
 
-    const loadingMsg = await reply(ctx, `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`);
+    // Loading message TANPA keyboard — biar bisa di-edit
+    const loadingMsg = await ctx.reply(
+        `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`,
+        { parse_mode: 'Markdown' }
+    );
 
     try {
         const photos    = ctx.message.photo;
@@ -1543,9 +1548,10 @@ async function handleTanya(ctx) {
         return;
     }
 
-    // Loading message
-    const loadingMsg = await reply(ctx,
-        `🤔 *Coach lagi mikir...*\n_Menyesuaikan jawaban dengan profil lo..._`
+    // Loading message TANPA keyboard — biar bisa di-edit
+    const loadingMsg = await ctx.reply(
+        `🤔 *Coach lagi mikir...*\n_Menyesuaikan jawaban dengan profil lo..._`,
+        { parse_mode: 'Markdown' }
     );
 
     try {
