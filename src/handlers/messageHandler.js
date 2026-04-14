@@ -69,7 +69,7 @@ async function handleStart(ctx) {
                 inline_keyboard: [[
                     {
                         text: '📱 Buka NutriBot App',
-                        web_app: { url: 'https://nutribot-miniapp.vercel.app' }
+                        web_app: { url: 'https://frontend-telegram-mini-app-nutribot.vercel.app/?v=1' }
                     }
                 ]]
             }
