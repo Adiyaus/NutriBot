@@ -60,13 +60,23 @@ async function handleStart(ctx) {
     const existingUser = await db.getUser(tgId);
 
     if (existingUser?.is_registered) {
-        await reply(ctx,
-            `Heyy ${existingUser.name}! 👋 Welcome back!\n\n` +
-            `Target kalori lo: *${Math.round(existingUser.daily_calorie_goal)} kkal/hari*\n\n` +
-            `Kirim *foto makanan* buat mulai log, atau ketik /help! 😊`
-        );
-        return;
-    }
+    await reply(ctx,
+        `Heyy ${existingUser.name}! 👋 Welcome back!\n\n` +
+        `Target kalori lo: *${Math.round(existingUser.daily_calorie_goal)} kkal/hari*\n\n` +
+        `Kirim *foto makanan* atau buka Mini App! 😊`,
+        {
+            reply_markup: {
+                inline_keyboard: [[
+                    {
+                        text: '📱 Buka NutriBot App',
+                        web_app: { url: 'https://nutribot-miniapp.vercel.app' }
+                    }
+                ]]
+            }
+        }
+    );
+    return;
+}
 
     await db.upsertUser(tgId, {
         username: ctx.from.username || null,
