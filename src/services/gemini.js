@@ -82,7 +82,7 @@ async function callGemini(contents) {
         try {
             const client   = getClient();
             const response = await client.models.generateContent({
-                model: 'gemini-2.5-flash-lite',
+                model: 'gemini-2.5-flash',
                 contents
             });
             return response.text; // sukses → return langsung
@@ -139,7 +139,12 @@ async function downloadImage(fileUrl) {
 
 // ─── ANALISIS DARI FOTO ───────────────────────────────────────
 
-async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg') {
+async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
+    // Kalau user kasih konteks, masukin ke prompt biar Gemini lebih akurat
+    const contextLine = userContext
+        ? `\nINFO TAMBAHAN DARI USER: "${userContext}" — prioritaskan info ini untuk identifikasi makanan`
+        : '';
+
     const prompt = `
 Kamu adalah ahli nutrisi profesional. Analisis gambar makanan ini secara detail.
 
@@ -148,7 +153,7 @@ ATURAN:
 - Identifikasi semua item makanan yang terlihat
 - Estimasi porsi berdasarkan visual (piring standar, mangkok biasa, dll)
 - Berikan estimasi nutrisi yang REALISTIS berdasarkan porsi tersebut
-- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia
+- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia${contextLine}
 
 Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
 {
@@ -166,7 +171,6 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
     try {
         const base64Image = imageBuffer.toString('base64');
 
-        // Pakai callGemini wrapper — auto rotate key kalau rate limit
         const rawText = await callGemini([{
             role: 'user',
             parts: [

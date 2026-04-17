@@ -13,6 +13,8 @@ const adjustModeMap   = new Map();
 const editModeMap     = new Map();
 const saveMenuModeMap = new Map();
 const inputModeMap    = new Map();
+const photoContextMap = new Map(); // nunggu konteks dari user setelah kirim foto
+// photoContextMap value: { fileId, fileUrl } — simpan foto sementara
 
 // ─── KEYBOARD LAYOUT ─────────────────────────────────────────
 
@@ -60,23 +62,13 @@ async function handleStart(ctx) {
     const existingUser = await db.getUser(tgId);
 
     if (existingUser?.is_registered) {
-    await reply(ctx,
-        `Heyy ${existingUser.name}! 👋 Welcome back!\n\n` +
-        `Target kalori lo: *${Math.round(existingUser.daily_calorie_goal)} kkal/hari*\n\n` +
-        `Kirim *foto makanan* atau buka Mini App! 😊`,
-        {
-            reply_markup: {
-                inline_keyboard: [[
-                    {
-                        text: '📱 Buka NutriBot App',
-                        web_app: { url: 'https://frontend-telegram-mini-app-nutribot.vercel.app/?v=1' }
-                    }
-                ]]
-            }
-        }
-    );
-    return;
-}
+        await reply(ctx,
+            `Heyy ${existingUser.name}! 👋 Welcome back!\n\n` +
+            `Target kalori lo: *${Math.round(existingUser.daily_calorie_goal)} kkal/hari*\n\n` +
+            `Kirim *foto makanan* buat mulai log, atau ketik /help! 😊`
+        );
+        return;
+    }
 
     await db.upsertUser(tgId, {
         username: ctx.from.username || null,
@@ -677,6 +669,13 @@ async function handleText(ctx) {
     const body = ctx.message.text?.trim() || '';
     const user = await db.getUser(tgId);
 
+    // ── Mode: nunggu konteks foto ────────────────────────────
+    // Dicek PERTAMA biar gak bentrok sama mode lain
+    if (photoContextMap.has(tgId)) {
+        await handlePhotoContext(ctx, tgId, body);
+        return;
+    }
+
     // ── Mode: input manual nutrisi ───────────────────────────
     if (inputModeMap.has(tgId)) {
         await handleInputStep(ctx, tgId, body);
@@ -707,6 +706,7 @@ async function handleText(ctx) {
         saveMenuModeMap.delete(tgId);
         inputModeMap.delete(tgId);
         editModeMap.delete(tgId);
+        photoContextMap.delete(tgId);
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
     }
@@ -1070,6 +1070,19 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
+    // ── Skip konteks foto — langsung analisis tanpa konteks ──
+    if (data === 'photo_skip_context') {
+        await ctx.answerCbQuery();
+        const photoData = photoContextMap.get(tgId);
+        if (!photoData) {
+            await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
+            return;
+        }
+        await ctx.editMessageText(`Oke, langsung analisis! 🔍`);
+        await processPhotoAnalysis(ctx, tgId, photoData.fileUrl, '');
+        return;
+    }
+
     // ── Update profil ────────────────────────────────────────
     if (data === 'update_profile') {
         await db.upsertUser(tgId, { registration_step: 'ask_name', is_registered: false });
@@ -1268,26 +1281,76 @@ async function handlePhoto(ctx) {
         return;
     }
 
-    // Clear semua mode yang aktif — konsisten dengan handleCatat
+    // Clear semua mode yang aktif
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
     inputModeMap.delete(tgId);
     editModeMap.delete(tgId);
-
-    // Loading message TANPA keyboard — biar bisa di-edit
-    const loadingMsg = await ctx.reply(
-        `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`,
-        { parse_mode: 'Markdown' }
-    );
+    photoContextMap.delete(tgId);
 
     try {
+        // Ambil file info foto dulu — simpan ke memory buat diproses setelah konteks
         const photos    = ctx.message.photo;
         const bestPhoto = photos[photos.length - 1];
         const fileInfo  = await ctx.telegram.getFile(bestPhoto.file_id);
         const fileUrl   = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
+        // Simpan foto ke memory, tunggu konteks dari user
+        photoContextMap.set(tgId, { fileUrl });
+
+        // Tanya konteks — pakai inline keyboard buat opsi skip
+        await ctx.reply(
+            `📸 Foto diterima!\n\n` +
+            `*Ada info tambahan tentang makanannya?*\n` +
+            `_(contoh: "nasi goreng spesial warung bu Tini", "porsi besar", "pakai santan")_\n\n` +
+            `Info tambahan bikin estimasi lebih akurat! 🎯`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '⚡ Skip, langsung analisis', callback_data: 'photo_skip_context' }
+                    ]]
+                }
+            }
+        );
+
+    } catch (err) {
+        console.error(`[PhotoHandler] Error get file for ${tgId}:`, err.message);
+        await reply(ctx, `❌ Gagal ambil foto. Coba kirim ulang ya!`);
+    }
+}
+
+/**
+ * Handle konteks teks yang dikirim user setelah foto
+ * Dipanggil dari handleText waktu photoContextMap aktif
+ */
+async function handlePhotoContext(ctx, tgId, context) {
+    const photoData = photoContextMap.get(tgId);
+    if (!photoData) return;
+
+    // Langsung proses dengan konteks yang diberikan
+    await processPhotoAnalysis(ctx, tgId, photoData.fileUrl, context.trim());
+}
+
+/**
+ * Core: download foto + kirim ke Gemini + log hasilnya
+ * Dipanggil dari handlePhotoContext atau callback skip
+ */
+async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
+    const user = await db.getUser(tgId);
+    photoContextMap.delete(tgId); // hapus dari memory
+
+    // Loading message TANPA keyboard — biar bisa di-edit
+    const loadingMsg = await ctx.reply(
+        userContext
+            ? `Sebentar ya... 🔍\n_Gemini analisis dengan konteks: "${userContext}"..._`
+            : `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`,
+        { parse_mode: 'Markdown' }
+    );
+
+    try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
-        const result      = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg');
+        const result      = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
 
         if (!result.is_food) {
             await ctx.telegram.editMessageText(
@@ -1664,6 +1727,7 @@ function resetDailyMemory() {
     editModeMap.clear();
     saveMenuModeMap.clear();
     inputModeMap.clear();
+    photoContextMap.clear();
     console.log('[Memory] Daily reset — semua state map cleared');
 }
 
