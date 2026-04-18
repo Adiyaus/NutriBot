@@ -311,18 +311,27 @@ function handleGeminiError(err) {
  * @param {string} question - pertanyaan dari user
  * @returns {string} jawaban dari coach
  */
-async function generateCoachAnswer(user, todaySummary, question) {
+/**
+ * Jawab pertanyaan user dengan memory percakapan
+ *
+ * @param {object} user         - profil user dari DB
+ * @param {object} todaySummary - progress kalori hari ini
+ * @param {string} question     - pertanyaan terbaru dari user
+ * @param {Array}  history      - array { role: 'user'|'assistant', content: string }
+ * @returns {string} jawaban dari coach
+ */
+async function generateCoachAnswer(user, todaySummary, question, history = []) {
     const consumed  = Math.round(todaySummary?.total_calories || 0);
     const remaining = Math.round((user.daily_calorie_goal || 0) - consumed);
+    const heightM   = user.height_cm / 100;
+    const bmi       = (user.weight_kg / (heightM * heightM)).toFixed(1);
 
-    // Hitung BMI realtime dari data user
-    const heightM = user.height_cm / 100;
-    const bmi     = (user.weight_kg / (heightM * heightM)).toFixed(1);
-
-    const prompt = `
+    // System prompt sebagai pesan pertama — kasih konteks profil user
+    const systemPrompt = `
 Kamu adalah coach diet & nutrisi profesional bernama Coach NutriBot. 
 Lo friendly, evidence-based, dan gaya bahasa lo campuran Indonesia-Inggris (Jaksel style).
 Jawaban lo harus PERSONAL — selalu kaitkan dengan kondisi spesifik user ini.
+PENTING: Lo punya memori percakapan — kalau user nanya lanjutan, gunakan konteks sebelumnya.
 
 DATA LENGKAP USER:
 - Nama: ${user.name}
@@ -342,25 +351,34 @@ PROGRESS HARI INI:
 - Sisa kalori: ${remaining} kkal
 - Sudah makan: ${todaySummary?.meal_count || 0}x
 
-PERTANYAAN USER:
-"${question}"
-
 ATURAN JAWABAN:
 - Jawab langsung, to-the-point, max 5-7 kalimat
-- Selalu personalisasi dengan data user di atas — jangan jawab generik
-- Kalau pertanyaan soal olahraga, sesuaikan dengan berat badan & level aktivitas user
-- Kalau pertanyaan soal makanan/nutrisi, kaitkan dengan target kalori user
+- Kalau pertanyaan lanjutan, sambung dari konteks percakapan sebelumnya
 - Kalau pertanyaan di luar topik diet/nutrisi/olahraga/kesehatan, tolak dengan sopan
-- Boleh kasih 1-2 saran konkret yang actionable
 - Gunakan angka spesifik dari data user kalau relevan
 
 Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
     `.trim();
 
+    // Build contents array untuk Gemini — support multi-turn conversation
+    // Format: [system, ...history, pertanyaan terbaru]
+    const contents = [
+        // Pesan pertama: system prompt sebagai konteks (role user, tapi isinya instruksi)
+        { role: 'user',  parts: [{ text: systemPrompt }] },
+        { role: 'model', parts: [{ text: 'Siap! Gua Coach NutriBot, tanya aja soal diet & nutrisi lo.' }] },
+
+        // Inject history percakapan sebelumnya
+        ...history.map(msg => ({
+            role:  msg.role === 'user' ? 'user' : 'model', // Gemini pakai 'model' bukan 'assistant'
+            parts: [{ text: msg.content }]
+        })),
+
+        // Pertanyaan terbaru
+        { role: 'user', parts: [{ text: question }] }
+    ];
+
     try {
-        const rawText = await callGemini([{
-            role: 'user', parts: [{ text: prompt }]
-        }]);
+        const rawText = await callGemini(contents);
         return rawText.trim();
 
     } catch (err) {

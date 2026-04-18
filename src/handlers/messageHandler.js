@@ -13,8 +13,10 @@ const adjustModeMap   = new Map();
 const editModeMap     = new Map();
 const saveMenuModeMap = new Map();
 const inputModeMap    = new Map();
-const photoContextMap = new Map(); // nunggu konteks dari user setelah kirim foto
-// photoContextMap value: { fileId, fileUrl } — simpan foto sementara
+const photoContextMap = new Map();
+const coachHistoryMap = new Map(); // simpan history percakapan /tanya per user
+// coachHistoryMap value: Array of { role: 'user'|'assistant', content: string }
+// Max 10 pesan terakhir biar gak kebanyakan token
 
 // ─── KEYBOARD LAYOUT ─────────────────────────────────────────
 
@@ -96,6 +98,7 @@ async function handleHelp(ctx) {
         `*/catat [makanan]* — log makanan tanpa foto\n` +
         `*/input* — input nutrisi manual (template)\n` +
         `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
+        `*/lupain* — reset history percakapan coach\n` +
         `*/profil* — lihat & update data profil\n` +
         `*/reset* — hapus semua log hari ini\n` +
         `*/hapus* — hapus 1 log spesifik hari ini\n` +
@@ -1585,6 +1588,28 @@ async function handleInputStep(ctx, tgId, body) {
     }
 }
 
+/**
+ * /lupain — reset history percakapan coach
+ */
+async function handleLupain(ctx) {
+    const tgId = ctx.from.id;
+    const history = coachHistoryMap.get(tgId) || [];
+
+    if (history.length === 0) {
+        await reply(ctx, `Belum ada percakapan yang perlu di-reset. Tanya dulu lewat /tanya! 😊`);
+        return;
+    }
+
+    const turnCount = Math.floor(history.length / 2);
+    coachHistoryMap.delete(tgId);
+
+    await reply(ctx,
+        `🧹 *History percakapan direset!*\n\n` +
+        `${turnCount} pertanyaan sebelumnya udah dilupain.\n` +
+        `Coach siap mulai percakapan baru! 😊`
+    );
+}
+
 // ─── NEW: TANYA COACH ─────────────────────────────────────────
 
 async function handleTanya(ctx) {
@@ -1596,22 +1621,27 @@ async function handleTanya(ctx) {
         return;
     }
 
-    // Ambil pertanyaan setelah "/tanya "
     const fullText = ctx.message.text || '';
     const question = fullText.replace(/^\/tanya\s*/i, '').trim();
 
-    // Kalau gak ada pertanyaan, kasih contoh
+    // Command /tanya tanpa pertanyaan → tampilkan menu + info memory
     if (!question) {
+        const history    = coachHistoryMap.get(tgId) || [];
+        const hasHistory = history.length > 0;
+
         await reply(ctx,
             `🤔 *Tanya Apa ke Coach?*\n\n` +
             `Format: \`/tanya [pertanyaan lo]\`\n\n` +
-            `*Contoh pertanyaan:*\n` +
+            `*Contoh:*\n` +
             `• \`/tanya olahraga apa yang cocok buat aku?\`\n` +
             `• \`/tanya kenapa aku lapar terus?\`\n` +
             `• \`/tanya berapa protein yang aku butuhkan?\`\n` +
-            `• \`/tanya boleh makan nasi malam hari ga?\`\n` +
-            `• \`/tanya cara atasi plateau diet gimana?\`\n\n` +
-            `_Coach bakal jawab berdasarkan data profil lo personally!_ 💪`
+            `• \`/tanya boleh makan nasi malam hari ga?\`\n\n` +
+            `${hasHistory
+                ? `🧠 _Coach masih ingat ${Math.floor(history.length / 2)} pertanyaan terakhir lo._\n` +
+                  `_Ketik /lupain buat reset percakapan._`
+                : `_Coach bakal jawab berdasarkan data profil lo!_ 💪`
+            }`
         );
         return;
     }
@@ -1621,18 +1651,32 @@ async function handleTanya(ctx) {
         return;
     }
 
-    // Loading message TANPA keyboard — biar bisa di-edit
+    // Ambil history percakapan user yang ada
+    const history = coachHistoryMap.get(tgId) || [];
+
     const loadingMsg = await ctx.reply(
-        `🤔 *Coach lagi mikir...*\n_Menyesuaikan jawaban dengan profil lo..._`,
+        history.length > 0
+            ? `🤔 *Coach lagi mikir...*\n_Mengingat konteks percakapan sebelumnya..._`
+            : `🤔 *Coach lagi mikir...*\n_Menyesuaikan jawaban dengan profil lo..._`,
         { parse_mode: 'Markdown' }
     );
 
     try {
-        // Ambil progress hari ini buat konteks jawaban yang lebih relevan
         const todaySummary = await db.getDailySummary(tgId);
 
-        // Generate jawaban personal dari Gemini
-        const answer = await gemini.generateCoachAnswer(user, todaySummary, question);
+        // Kirim pertanyaan + history ke Gemini
+        const answer = await gemini.generateCoachAnswer(user, todaySummary, question, history);
+
+        // Simpan Q&A ke history — max 10 pesan (5 pasang Q&A) biar hemat token
+        history.push({ role: 'user',      content: question });
+        history.push({ role: 'assistant', content: answer   });
+
+        // Trim ke 10 pesan terakhir kalau lebih
+        if (history.length > 10) history.splice(0, history.length - 10);
+
+        coachHistoryMap.set(tgId, history);
+
+        const turnCount = Math.floor(history.length / 2);
 
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
@@ -1640,13 +1684,12 @@ async function handleTanya(ctx) {
             `_"${question}"_\n\n` +
             `━━━━━━━━━━━━━━\n\n` +
             `${answer}\n\n` +
-            `_Mau tanya lagi? /tanya [pertanyaan]_ 😊`,
+            `_🧠 Coach ingat ${turnCount} pertanyaan · /tanya lagi atau /lupain buat reset_`,
             { parse_mode: 'Markdown' }
         );
 
     } catch (err) {
         console.error(`[TanyaHandler] Error for ${tgId}:`, err.message);
-
         const errMsg = err.message === 'RATE_LIMIT'
             ? `⏳ Coach lagi sibuk. Tunggu ~1 menit terus coba lagi ya!`
             : `😵 Ada error. Coba tanya lagi!`;
@@ -1728,6 +1771,7 @@ function resetDailyMemory() {
     saveMenuModeMap.clear();
     inputModeMap.clear();
     photoContextMap.clear();
+    coachHistoryMap.clear();
     console.log('[Memory] Daily reset — semua state map cleared');
 }
 
@@ -1735,7 +1779,7 @@ module.exports = {
     handleStart, handleHelp, handleStatus, handleLaporan,
     handleProfil, handleReset, handleHapus, handleAdjust,
     handleStreak, handleTarget, handleRemind,
-    handleMenu, handleCatat, handleInput, handleTanya,
+    handleMenu, handleCatat, handleInput, handleTanya, handleLupain,
     handleText, handleCallbackQuery, handlePhoto,
     resetDailyMemory
 };
