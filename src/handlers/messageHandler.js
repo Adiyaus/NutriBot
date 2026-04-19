@@ -487,6 +487,49 @@ async function handleRemind(ctx) {
  * /menu — tampilkan daftar menu tersimpan
  * User bisa klik menu → langsung ke-log ke hari ini
  */
+const MENU_PAGE_SIZE = 8; // menu per halaman
+
+/**
+ * Build inline keyboard untuk list menu dengan pagination
+ */
+function buildMenuKeyboard(menus, page = 0, mode = 'log') {
+    const totalPages = Math.ceil(menus.length / MENU_PAGE_SIZE);
+    const start      = page * MENU_PAGE_SIZE;
+    const pageMenus  = menus.slice(start, start + MENU_PAGE_SIZE);
+
+    // Tombol menu di halaman ini
+    const buttons = pageMenus.map(m => ([{
+        text: mode === 'log'
+            ? `${m.menu_name} (${Math.round(m.calories)} kkal)${m.use_count > 0 ? ` ×${m.use_count}` : ''}`
+            : `🗑️ ${m.menu_name}`,
+        callback_data: mode === 'log'
+            ? `log_menu_${m.id}`
+            : `delete_menu_${m.id}`
+    }]));
+
+    // Baris navigasi: Prev | halaman | Next
+    const navRow = [];
+    if (page > 0) {
+        navRow.push({ text: '← Prev', callback_data: `menu_page_${mode}_${page - 1}` });
+    }
+    if (totalPages > 1) {
+        navRow.push({ text: `${page + 1}/${totalPages}`, callback_data: 'noop' });
+    }
+    if (page < totalPages - 1) {
+        navRow.push({ text: 'Next →', callback_data: `menu_page_${mode}_${page + 1}` });
+    }
+    if (navRow.length > 0) buttons.push(navRow);
+
+    // Action button bawah
+    if (mode === 'log') {
+        buttons.push([{ text: '🗑️ Hapus Menu', callback_data: 'show_delete_menu' }]);
+    } else {
+        buttons.push([{ text: '← Balik', callback_data: 'back_to_menu' }]);
+    }
+
+    return buttons;
+}
+
 async function handleMenu(ctx) {
     const tgId = ctx.from.id;
     const user = await db.getUser(tgId);
@@ -510,25 +553,12 @@ async function handleMenu(ctx) {
         return;
     }
 
-    // Build inline keyboard — setiap menu jadi satu baris tombol
-    // Maksimal 10 menu ditampilkan biar gak terlalu panjang
-    const displayMenus = menus.slice(0, 10);
-
-    const menuButtons = displayMenus.map(m => ([{
-        text: `${m.menu_name} (${Math.round(m.calories)} kkal)${m.use_count > 0 ? ` ×${m.use_count}` : ''}`,
-        callback_data: `log_menu_${m.id}` // callback buat log menu ini
-    }]));
-
-    // Tombol hapus menu di baris terakhir
-    menuButtons.push([{ text: '🗑️ Hapus Menu', callback_data: 'show_delete_menu' }]);
-
     await ctx.reply(
         `🍽️ *Menu Tersimpan Lo (${menus.length}):*\n\n` +
-        `Pilih menu di bawah buat langsung log ke hari ini! 👇\n\n` +
-        `_${menus.length > 10 ? `Showing 10 dari ${menus.length} menu` : ''}_`,
+        `Pilih menu di bawah buat langsung log ke hari ini! 👇`,
         {
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: menuButtons }
+            parse_mode:   'Markdown',
+            reply_markup: { inline_keyboard: buildMenuKeyboard(menus, 0, 'log') }
         }
     );
 }
@@ -1203,18 +1233,11 @@ async function handleCallbackQuery(ctx) {
             return;
         }
 
-        const deleteButtons = menus.slice(0, 10).map(m => ([{
-            text: `🗑️ ${m.menu_name}`,
-            callback_data: `delete_menu_${m.id}`
-        }]));
-
-        deleteButtons.push([{ text: '← Balik', callback_data: 'back_to_menu' }]);
-
         await ctx.editMessageText(
-            `🗑️ *Pilih menu yang mau dihapus:*`,
+            `🗑️ *Pilih menu yang mau dihapus:*\n_(${menus.length} menu)_`,
             {
-                parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: deleteButtons }
+                parse_mode:   'Markdown',
+                reply_markup: { inline_keyboard: buildMenuKeyboard(menus, 0, 'delete') }
             }
         );
         return;
@@ -1233,7 +1256,6 @@ async function handleCallbackQuery(ctx) {
         await db.deleteMenu(menuId, tgId);
         await ctx.answerCbQuery(`"${menu.menu_name}" dihapus!`, { show_alert: true });
 
-        // Refresh list menu setelah hapus
         const remainingMenus = await db.getSavedMenus(tgId);
 
         if (remainingMenus.length === 0) {
@@ -1243,31 +1265,44 @@ async function handleCallbackQuery(ctx) {
             return;
         }
 
-        const deleteButtons = remainingMenus.slice(0, 10).map(m => ([{
-            text: `🗑️ ${m.menu_name}`,
-            callback_data: `delete_menu_${m.id}`
-        }]));
-        deleteButtons.push([{ text: '← Balik', callback_data: 'back_to_menu' }]);
+        await ctx.editMessageText(
+            `🗑️ *Pilih menu yang mau dihapus:*\n_(${remainingMenus.length} menu)_`,
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buildMenuKeyboard(remainingMenus, 0, 'delete') } }
+        );
+        return;
+    }
+
+    // ── Navigasi halaman menu (log & delete mode) ─────────────
+    if (data.startsWith('menu_page_')) {
+        // format: menu_page_log_2 atau menu_page_delete_2
+        const parts  = data.split('_');            // ['menu','page','log','2']
+        const mode   = parts[2];                   // 'log' atau 'delete'
+        const page   = parseInt(parts[3]);
+        const menus  = await db.getSavedMenus(tgId);
+
+        const headerText = mode === 'log'
+            ? `🍽️ *Menu Tersimpan Lo (${menus.length}):*\n\nPilih menu buat log ke hari ini! 👇`
+            : `🗑️ *Pilih menu yang mau dihapus:*\n_(${menus.length} menu)_`;
 
         await ctx.editMessageText(
-            `🗑️ *Pilih menu yang mau dihapus:*`,
-            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: deleteButtons } }
+            headerText,
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buildMenuKeyboard(menus, page, mode) } }
         );
+        return;
+    }
+
+    // ── Tombol noop (label halaman, gak ngapa-ngapain) ────────
+    if (data === 'noop') {
+        await ctx.answerCbQuery();
         return;
     }
 
     // ── Balik ke list menu ────────────────────────────────────
     if (data === 'back_to_menu') {
         const menus = await db.getSavedMenus(tgId);
-        const menuButtons = menus.slice(0, 10).map(m => ([{
-            text: `${m.menu_name} (${Math.round(m.calories)} kkal)${m.use_count > 0 ? ` ×${m.use_count}` : ''}`,
-            callback_data: `log_menu_${m.id}`
-        }]));
-        menuButtons.push([{ text: '🗑️ Hapus Menu', callback_data: 'show_delete_menu' }]);
-
         await ctx.editMessageText(
             `🍽️ *Menu Tersimpan Lo (${menus.length}):*\n\nPilih menu buat log ke hari ini! 👇`,
-            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: menuButtons } }
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buildMenuKeyboard(menus, 0, 'log') } }
         );
         return;
     }
