@@ -1474,15 +1474,120 @@ async function handleInput(ctx) {
         return;
     }
 
-    // Mulai state machine input manual
+    // Cek apakah ada argumen setelah /input — kalau ada, coba parse template langsung
+    const fullText  = ctx.message.text || '';
+    const afterCmd  = fullText.replace(/^\/input\s*/i, '').trim();
+
+    if (afterCmd) {
+        // User langsung ketik: /input Nasi Padang | 650 25 80 20
+        await handleInputTemplate(ctx, tgId, afterCmd, user);
+        return;
+    }
+
+    // Mulai state machine tanya satu-satu
     inputModeMap.set(tgId, { step: 'ask_name' });
 
     await reply(ctx,
         `📝 *Input Nutrisi Manual*\n\n` +
-        `Gua bakal tanya satu-satu ya. Ketik /batal buat cancel.\n\n` +
-        `*Nama makanannya apa?*\n` +
-        `_(contoh: Nasi Padang, Mie Goreng Indomie, Roti Gandum)_`
+        `*Cara cepat (1 pesan):*\n` +
+        `\`/input Nama Makanan | kalori protein karbo lemak\`\n` +
+        `_Contoh: \`/input Nasi Padang | 650 25 80 20\`_\n\n` +
+        `*Cara biasa (step by step):*\n` +
+        `Ketik nama makanannya sekarang 👇\n` +
+        `_(atau /batal buat cancel)_`
     );
+}
+
+/**
+ * Parse dan log template input sekaligus: "Nasi Padang | 650 25 80 20"
+ * Format: [nama] | [kalori] [protein] [karbo] [lemak]
+ * Protein, karbo, lemak opsional — bisa diisi 0
+ */
+async function handleInputTemplate(ctx, tgId, text, user) {
+    // Split by | atau koma — support dua format
+    const parts = text.split(/\|/).map(s => s.trim());
+
+    if (parts.length < 2) {
+        // Gak ada separator — anggap user cuma mau mulai step-by-step dengan nama
+        inputModeMap.set(tgId, { step: 'ask_calories', name: text });
+        await reply(ctx,
+            `Oke, *"${text}"* ✅\n\n` +
+            `*Kalorinya berapa? (kkal)*\n_(contoh: 450 — atau ketik 0 kalau gak tau)_`
+        );
+        return;
+    }
+
+    const name      = parts[0];
+    const numbers   = parts[1].trim().split(/\s+/).map(Number);
+
+    // Validasi nama
+    if (!name || name.length < 2) {
+        await reply(ctx, `Nama makanan minimal 2 karakter ya!\nContoh: \`/input Nasi Goreng | 650 22 80 18\``);
+        return;
+    }
+
+    // Validasi angka — minimal kalori harus ada
+    if (numbers.length === 0 || isNaN(numbers[0])) {
+        await reply(ctx,
+            `Format angkanya salah nih!\n\n` +
+            `Yang bener: \`/input ${name} | kalori protein karbo lemak\`\n` +
+            `Contoh: \`/input ${name} | 650 25 80 20\``
+        );
+        return;
+    }
+
+    const calories  = Math.max(0, numbers[0] || 0);
+    const protein_g = Math.max(0, numbers[1] || 0);
+    const carbs_g   = Math.max(0, numbers[2] || 0);
+    const fat_g     = Math.max(0, numbers[3] || 0);
+
+    // Validasi range
+    if (calories > 5000) {
+        await reply(ctx, `Kalori kayaknya kegedean nih (max 5000). Cek lagi ya!`);
+        return;
+    }
+
+    try {
+        const savedLog = await db.insertFoodLog(tgId, {
+            food_description: name,
+            calories, protein_g, carbs_g, fat_g
+        });
+
+        lastLogIdMap.set(tgId, savedLog.id);
+        lastResultMap.set(tgId, { food_description: name, calories, protein_g, carbs_g, fat_g });
+
+        const summary   = await db.getDailySummary(tgId);
+        const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
+
+        const statusEmoji   = remaining > 0 ? '✅' : '🚨';
+        const remainingText = remaining > 0
+            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
+            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+
+        await reply(ctx,
+            `${statusEmoji} *Makanan Tercatat!*\n\n` +
+            `🍽️ *${name}*\n\n` +
+            `🔥 Kalori: *${calories} kkal*\n` +
+            `💪 Protein: *${protein_g}g*\n` +
+            `🍚 Karbo: *${carbs_g}g*\n` +
+            `🥑 Lemak: *${fat_g}g*\n\n` +
+            `_Input manual_ ✍️\n\n` +
+            `━━━━━━━━━━━━━━\n` +
+            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
+            `${remainingText}`,
+            {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
+                        { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }
+                    ]]
+                }
+            }
+        );
+    } catch (err) {
+        console.error(`[InputTemplate] Error for ${tgId}:`, err.message);
+        await reply(ctx, `😵 Gagal nyimpen. Coba lagi ya!`);
+    }
 }
 
 /**
@@ -1754,19 +1859,49 @@ function buildStatusMessage(summary, dailyGoal, foodList = []) {
     const remaining  = Math.round(dailyGoal - consumed);
     const percentage = Math.min(100, Math.round((consumed / dailyGoal) * 100));
 
-    // Build food list section kalau ada data
+    // ── Indikator warna berdasarkan sisa kalori ───────────────
+    // 0 API call — pure logic di server
+    let statusIndicator, remainingLabel, footerMsg;
+
+    if (remaining < 0) {
+        // Over budget
+        statusIndicator = '🔴';
+        remainingLabel  = `*Over ${Math.abs(remaining)} kkal* dari target!`;
+        footerMsg       = '⚠️ _Lo over budget hari ini. Besok bisa lebih baik!_';
+    } else if (remaining <= 200) {
+        // Hampir habis — kuning
+        statusIndicator = '🟡';
+        remainingLabel  = `*${remaining} kkal* sisa — udah mepet!`;
+        footerMsg       = '⚡ _Sisa kalori mepet. Pilih camilan ringan aja!_';
+    } else if (percentage >= 80) {
+        // Udah di atas 80% — oranye warning
+        statusIndicator = '🟠';
+        remainingLabel  = `*${remaining} kkal* sisa`;
+        footerMsg       = '👀 _Udah 80%+ dari target. Pantau terus ya!_';
+    } else if (percentage >= 50) {
+        // Normal — hijau
+        statusIndicator = '🟢';
+        remainingLabel  = `*${remaining} kkal* sisa`;
+        footerMsg       = '✅ _On track! Keep going! 💪_';
+    } else {
+        // Baru mulai / masih banyak — hijau terang
+        statusIndicator = '🟢';
+        remainingLabel  = `*${remaining} kkal* sisa`;
+        footerMsg       = consumed === 0
+            ? '📭 _Belum ada log hari ini. Yuk mulai!_'
+            : '✅ _Masih banyak ruang. Keep it up!_';
+    }
+
+    // Build food list section
     let foodListText = '';
     if (foodList.length > 0) {
         foodListText = `\n🍽️ *Yang Udah Dimakan:*\n`;
         foodList.forEach((food, i) => {
-            // Format jam dari logged_at (WIB = UTC+7)
             const loggedAt  = new Date(food.logged_at);
             const wibHour   = String((loggedAt.getUTCHours() + 7) % 24).padStart(2, '0');
             const wibMinute = String(loggedAt.getUTCMinutes()).padStart(2, '0');
             const timeStr   = `${wibHour}:${wibMinute}`;
-
-            // Truncate nama makanan kalau terlalu panjang
-            const name = food.food_description.length > 40
+            const name      = food.food_description.length > 40
                 ? food.food_description.substring(0, 40) + '...'
                 : food.food_description;
 
@@ -1778,18 +1913,15 @@ function buildStatusMessage(summary, dailyGoal, foodList = []) {
     }
 
     return (
-        `📊 *Status Kalori Hari Ini:*\n\n` +
+        `${statusIndicator} *Status Kalori Hari Ini:*\n\n` +
         `${buildProgressBar(percentage)} ${percentage}%\n\n` +
         `🔥 Terpakai: *${consumed} / ${Math.round(dailyGoal)} kkal*\n` +
-        `📉 Sisa: *${remaining > 0 ? remaining : 0} kkal*\n\n` +
+        `📉 Sisa: ${remainingLabel}\n\n` +
         `💪 Protein: ${(summary.total_protein || 0).toFixed(1)}g\n` +
         `🍚 Karbo: ${(summary.total_carbs || 0).toFixed(1)}g\n` +
         `🥑 Lemak: ${(summary.total_fat || 0).toFixed(1)}g\n` +
         foodListText +
-        `\n${remaining < 0
-            ? '⚠️ _Lo over budget kalori hari ini!_'
-            : '✅ _Keep going, lo on track!_'
-        }`
+        `\n${footerMsg}`
     );
 }
 
