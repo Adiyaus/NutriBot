@@ -82,7 +82,7 @@ async function callGemini(contents) {
         try {
             const client   = getClient();
             const response = await client.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: 'gemini-1.5-flash',
                 contents
             });
             return response.text; // sukses → return langsung
