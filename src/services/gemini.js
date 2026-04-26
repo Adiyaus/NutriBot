@@ -139,41 +139,50 @@ async function downloadImage(fileUrl) {
 
 // ─── ANALISIS DARI FOTO ───────────────────────────────────────
 
-// src/services/gemini.js
-
 async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
-    const prompt = `
-Identifikasi makanan di foto ini. 
-PENTING: Berikan list item dalam Bahasa Inggris untuk API, dan deskripsi dalam Bahasa Indonesia untuk user.
-Berikan juga estimasi nutrisi kasar sebagai cadangan (fallback).
+    // Kalau user kasih konteks, masukin ke prompt biar Gemini lebih akurat
+    const contextLine = userContext
+        ? `\nINFO TAMBAHAN DARI USER: "${userContext}" — prioritaskan info ini untuk identifikasi makanan`
+        : '';
 
-Balas HANYA dengan format JSON:
+    const prompt = `
+Kamu adalah ahli nutrisi profesional. Analisis gambar makanan ini secara detail.
+
+ATURAN:
+- Kalau BUKAN makanan/minuman, set is_food: false dan semua angka ke 0
+- Identifikasi semua item makanan yang terlihat
+- Estimasi porsi berdasarkan visual (piring standar, mangkok biasa, dll)
+- Berikan estimasi nutrisi yang REALISTIS berdasarkan porsi tersebut
+- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia${contextLine}
+
+Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
 {
   "is_food": true,
-  "food_description_indo": "nasi putih, ayam goreng, sambal",
-  "items_for_api": ["1 cup of steamed rice", "1 piece of fried chicken", "1 tbsp of chili sauce"],
-  "fallback_estimate": {
-    "calories": 650,
-    "protein_g": 25.5,
-    "carbs_g": 80.0,
-    "fat_g": 20.0
-  }
+  "food_description": "deskripsi makanan dalam bahasa Indonesia, pisah dengan koma",
+  "calories": angka_kalori_integer,
+  "protein_g": angka_protein_satu_desimal,
+  "carbs_g": angka_karbo_satu_desimal,
+  "fat_g": angka_lemak_satu_desimal,
+  "confidence": "high/medium/low",
+  "notes": "catatan singkat estimasi porsi kalau perlu"
 }
     `.trim();
 
     try {
         const base64Image = imageBuffer.toString('base64');
-        // Asumsi lo pake wrapper callGemini yang sudah lo buat di kodingan awal
+
         const rawText = await callGemini([{
             role: 'user',
-            parts: [{ text: prompt }, { inlineData: { mimeType, data: base64Image } }]
+            parts: [
+                { text: prompt },
+                { inlineData: { mimeType, data: base64Image } }
+            ]
         }]);
 
-        const cleaned = rawText.replace(/```json\n?|```/g, '').trim();
-        return JSON.parse(cleaned);
+        return parseNutritionResponse(rawText);
+
     } catch (err) {
-        console.error('[Gemini] Error:', err.message);
-        throw new Error('GEMINI_ERROR');
+        handleGeminiError(err);
     }
 }
 
