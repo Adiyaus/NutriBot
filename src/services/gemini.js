@@ -139,38 +139,31 @@ async function downloadImage(fileUrl) {
 
 // ─── ANALISIS DARI FOTO ───────────────────────────────────────
 
-async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
-    // Kalau user kasih konteks, masukin ke prompt biar Gemini lebih akurat
-    const contextLine = userContext
-        ? `\nINFO TAMBAHAN DARI USER: "${userContext}" — prioritaskan info ini untuk identifikasi makanan`
-        : '';
+// src/services/gemini.js
 
+async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
     const prompt = `
-Kamu adalah ahli nutrisi profesional. Analisis gambar makanan ini secara detail.
+Kamu adalah food analyst profesional. Lihat gambar ini dan identifikasi isinya.
 
 ATURAN:
-- Kalau BUKAN makanan/minuman, set is_food: false dan semua angka ke 0
-- Identifikasi semua item makanan yang terlihat
-- Estimasi porsi berdasarkan visual (piring standar, mangkok biasa, dll)
-- Berikan estimasi nutrisi yang REALISTIS berdasarkan porsi tersebut
-- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia${contextLine}
+1. Identifikasi tiap item makanan/minuman yang terlihat.
+2. Buat estimasi porsi yang masuk akal.
+3. Untuk field "items_for_api", gunakan Bahasa Inggris (karena API hanya paham Inggris).
+4. Untuk field "food_description", gunakan Bahasa Indonesia yang santai.
 
-Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
+Balas HANYA JSON ini:
 {
   "is_food": true,
-  "food_description": "deskripsi makanan dalam bahasa Indonesia, pisah dengan koma",
-  "calories": angka_kalori_integer,
-  "protein_g": angka_protein_satu_desimal,
-  "carbs_g": angka_karbo_satu_desimal,
-  "fat_g": angka_lemak_satu_desimal,
-  "confidence": "high/medium/low",
-  "notes": "catatan singkat estimasi porsi kalau perlu"
+  "food_description": "deskripsi ringkas dalam Bahasa Indonesia",
+  "items_for_api": [
+    { "name": "food name in English", "portion": "quantity, e.g. 100g, 1 piece, 1 bowl" }
+  ],
+  "confidence": "high/medium/low"
 }
     `.trim();
 
     try {
         const base64Image = imageBuffer.toString('base64');
-
         const rawText = await callGemini([{
             role: 'user',
             parts: [
@@ -179,10 +172,11 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
             ]
         }]);
 
-        return parseNutritionResponse(rawText);
-
+        // Parsing JSON (gunakan helper parseNutritionResponse lo yang lama)
+        const cleaned = rawText.replace(/```json\n?|```/g, '').trim();
+        return JSON.parse(cleaned);
     } catch (err) {
-        handleGeminiError(err);
+        throw new Error('GEMINI_ERROR');
     }
 }
 

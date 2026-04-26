@@ -1326,17 +1326,16 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
 
         // STEP 2: Grounding ke Edamam buat dapet angka presisi
         let nutritionData;
-        let dataSource = '📊 _Data dari Edamam Database_';
-
-        try {
-            // Kita bungkus data porsi & nama dari Gemini ke array buat Edamam
-            const foodList = [{ name: result.food_description, portion: result.notes || '1 serving' }];
-            nutritionData = await edamam.getNutritionData(foodList);
-        } catch (err) {
-            console.warn(`[Edamam] Gagal, pakai estimasi AI: ${err.message}`);
-            nutritionData = result; // Fallback ke Gemini kalau API Edamam rewel
-            dataSource = '⚠️ _Data estimasi (Edamam limit/unavailable)_';
-        }
+    try {
+        // STEP 2: Kirim ARRAY item ke Edamam (Gunakan result.items_for_api)
+        nutritionData = await edamam.getNutritionData(result.items_for_api);
+        
+        // Overwrite deskripsi pake bahasa Indonesia dari Gemini biar user nyaman baca
+        nutritionData.food_description = result.food_description; 
+    } catch (err) {
+        console.error("Edamam Error:", err.message);
+        throw err;
+    }
 
         // Simpan ke database
         const savedLog = await db.insertFoodLog(tgId, {
