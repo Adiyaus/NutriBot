@@ -1315,7 +1315,6 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     );
 
     // --- DEKLARASI VARIABEL UTAMA ---
-    let nutritionData;
     let dataSource = '📊 _Data dari Edamam Database_'; // Default label
 
     try {
@@ -1331,16 +1330,18 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             return;
         }
 
+        let nutritionData;
         try {
-            // STEP 2: Tembak ke Edamam pake list bahasa Inggris hasil Gemini
-            nutritionData = await edamam.getNutritionData(result.items_for_api);
-            // Pakai deskripsi Indo dari Gemini biar user nyaman baca
-            nutritionData.food_description = result.food_description; 
-        } catch (err) {
-            console.warn(`[Edamam] Gagal, pakai estimasi AI: ${err.message}`);
-            nutritionData = result; // Fallback ke Gemini jika API rewel
-            dataSource = '⚠️ _Data estimasi (Edamam unavailable)_';
-        }
+        // Kirim items_for_api (array) ke Edamam
+        nutritionData = await edamam.getNutritionData(result.items_for_api);
+        
+        // Pakai deskripsi bahasa Indonesia dari Gemini buat tampilan
+        nutritionData.food_description = result.food_description;
+    } catch (err) {
+        console.error("[Handler] Edamam failed, fallback to Gemini:", err.message);
+        nutritionData = result; 
+        dataSource = '⚠️ _Data estimasi (Edamam limit/error)_';
+    }
 
         // Simpan log ke database
         const savedLog = await db.insertFoodLog(tgId, {
