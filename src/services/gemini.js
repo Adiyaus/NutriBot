@@ -142,40 +142,37 @@ async function downloadImage(fileUrl) {
 // src/services/gemini.js
 
 async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
-    // src/services/gemini.js
-const prompt = `
-Identifikasi makanan dari foto ini untuk dihitung kalorinya via API.
+    const prompt = `
+Identifikasi makanan di foto ini. 
+PENTING: Berikan list item dalam Bahasa Inggris untuk API, dan deskripsi dalam Bahasa Indonesia untuk user.
+Berikan juga estimasi nutrisi kasar sebagai cadangan (fallback).
 
-ATURAN WAJIB:
-1. List semua makanan di field "items_for_api" dalam BAHASA INGGRIS.
-2. Gunakan unit standar (gram, piece, atau cup) agar API tidak error. 
-   Contoh: "200g Steamed Rice", "1 piece Fried Chicken". JANGAN PAKAI "bowl" atau "piring".
-3. Field "food_description" pakai Bahasa Indonesia yang santai buat user.
-
-Balas HANYA JSON:
+Balas HANYA dengan format JSON:
 {
   "is_food": true,
-  "food_description": "Deskripsi Indo lo di sini",
-  "items_for_api": [
-    { "name": "food name", "portion": "weight in grams or pieces" }
-  ]
+  "food_description_indo": "nasi putih, ayam goreng, sambal",
+  "items_for_api": ["1 cup of steamed rice", "1 piece of fried chicken", "1 tbsp of chili sauce"],
+  "fallback_estimate": {
+    "calories": 650,
+    "protein_g": 25.5,
+    "carbs_g": 80.0,
+    "fat_g": 20.0
+  }
 }
-`.trim();
+    `.trim();
 
     try {
         const base64Image = imageBuffer.toString('base64');
+        // Asumsi lo pake wrapper callGemini yang sudah lo buat di kodingan awal
         const rawText = await callGemini([{
             role: 'user',
-            parts: [
-                { text: prompt },
-                { inlineData: { mimeType, data: base64Image } }
-            ]
+            parts: [{ text: prompt }, { inlineData: { mimeType, data: base64Image } }]
         }]);
 
-        // Parsing JSON (gunakan helper parseNutritionResponse lo yang lama)
         const cleaned = rawText.replace(/```json\n?|```/g, '').trim();
         return JSON.parse(cleaned);
     } catch (err) {
+        console.error('[Gemini] Error:', err.message);
         throw new Error('GEMINI_ERROR');
     }
 }
