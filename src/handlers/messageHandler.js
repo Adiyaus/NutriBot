@@ -5,6 +5,7 @@
 
 const db     = require('../services/database');
 const gemini = require('../services/gemini');
+const edamam = require('../services/edamam');
 const calc   = require('../utils/calculator');
 
 const lastLogIdMap    = new Map();
@@ -566,132 +567,56 @@ async function handleMenu(ctx) {
 // ─── NEW: CATAT MANUAL ───────────────────────────────────────
 
 /**
- * /catat [deskripsi makanan] — log makanan tanpa foto
- * User ketik langsung apa yang dimakan, Gemini estimasi nutrisinya
- *
- * Contoh:
- *   /catat nasi goreng 1 porsi, telur mata sapi 2
- *   /catat indomie goreng 1 bungkus + telur
- *   /catat ayam geprek 1 potong nasi putih
+ * Fungsi: handleCatat
+ * Penjelasan: Menangani input teks manual (misal: /catat nasi padang). 
+ * Gemini bakal strukturin teks lo, terus dilempar ke Edamam buat dapet nutrisi yang akurat.
  */
 async function handleCatat(ctx) {
     const tgId = ctx.from.id;
     const user = await db.getUser(tgId);
+    if (!user?.is_registered) return reply(ctx, `Lo belum daftar nih!`);
 
-    if (!user?.is_registered) {
-        await reply(ctx, `Lo belum daftar nih! 😅 Ketik /mulai dulu ya.`);
-        return;
-    }
-
-    // Clear semua mode yang mungkin aktif — biar gak ada konflik state
-    inputModeMap.delete(tgId);
-    editModeMap.delete(tgId);
-    adjustModeMap.delete(tgId);
-    saveMenuModeMap.delete(tgId);
-
-    // Ambil teks setelah "/catat "
     const fullText  = ctx.message.text || '';
     const foodInput = fullText.replace(/^\/catat\s*/i, '').trim();
 
-    // Kalau gak ada input, kasih contoh cara pakainya
-    if (!foodInput) {
-        await reply(ctx,
-            `📝 *Catat Makanan Manual*\n\n` +
-            `Format: \`/catat [deskripsi makanan]\`\n\n` +
-            `*Contoh:*\n` +
-            `• \`/catat nasi goreng 1 porsi\`\n` +
-            `• \`/catat indomie goreng + telur 2 butir\`\n` +
-            `• \`/catat ayam geprek 1 ekor, nasi putih, es teh\`\n` +
-            `• \`/catat roti tawar 2 lembar + selai kacang\`\n\n` +
-            `_Makin detail deskripsinya, makin akurat estimasinya!_ 💡`
-        );
-        return;
-    }
+    if (!foodInput) return reply(ctx, `Contoh: \`/catat 1 porsi ayam geprek\``);
 
-    // Validasi panjang input
-    if (foodInput.length > 300) {
-        await reply(ctx, `Deskripsinya terlalu panjang. Maksimal 300 karakter ya!`);
-        return;
-    }
-
-    // Kirim loading message TANPA keyboard — biar bisa di-edit setelah Gemini selesai
-    const loadingMsg = await ctx.reply(
-        `Sebentar ya... 🔍\n_Gemini lagi estimasi nutrisi "${foodInput}"..._`,
-        { parse_mode: 'Markdown' }
-    );
+    const loadingMsg = await ctx.reply(`🔍 _Estimasi nutrisi "${foodInput}" via Edamam..._`);
 
     try {
-        // Estimasi nutrisi dari teks — tanpa foto!
-        const result = await gemini.estimateNutritionFromText(foodInput);
-
-        // Kalau Gemini bilang bukan makanan
-        if (!result.is_food) {
-            await ctx.telegram.editMessageText(
-                ctx.chat.id, loadingMsg.message_id, null,
-                `Hmm, gua gak ngerti itu makanan apa... 🤔\n\n` +
-                `Coba tulis lebih spesifik ya!\n` +
-                `Contoh: \`/catat nasi goreng 1 porsi\``
-            );
-            return;
+        // STEP 1: Gemini buat bersihin teks jadi format {name, portion}
+        const aiStruct = await gemini.estimateNutritionFromText(foodInput);
+        
+        // STEP 2: Ambil data real dari Edamam
+        let nutritionData;
+        try {
+            nutritionData = await edamam.getNutritionData([{ name: aiStruct.food_description, portion: aiStruct.notes || '1 serving' }]);
+        } catch {
+            nutritionData = aiStruct; // Fallback kalau Edamam gagal
         }
 
-        // Simpan ke food_logs — sama persis kayak dari foto
-        const savedLog = await db.insertFoodLog(tgId, {
-            food_description: result.food_description,
-            calories:         result.calories,
-            protein_g:        result.protein_g,
-            carbs_g:          result.carbs_g,
-            fat_g:            result.fat_g,
-            gemini_raw:       result.gemini_raw
-        });
-
-        // Simpan ke memory buat fitur simpan ke menu
+        const savedLog = await db.insertFoodLog(tgId, nutritionData);
         lastLogIdMap.set(tgId, savedLog.id);
-        lastResultMap.set(tgId, result);
+        lastResultMap.set(tgId, nutritionData);
 
-        // Hitung sisa kalori
-        const summary   = await db.getDailySummary(tgId);
+        const summary = await db.getDailySummary(tgId);
         const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
-
-        const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-        const remainingText = remaining > 0
-            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
 
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
-            `${statusEmoji} *Makanan Tercatat!*\n\n` +
-            `📝 *${result.food_description}*\n\n` +
-            `🔥 Kalori: *${result.calories} kkal*\n` +
-            `💪 Protein: *${result.protein_g}g*\n` +
-            `🍚 Karbo: *${result.carbs_g}g*\n` +
-            `🥑 Lemak: *${result.fat_g}g*\n` +
-            `${result.notes ? `\n📌 _Asumsi: ${result.notes}_\n` : ''}` +
-            `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah — coba tulis lebih detail_\n' : ''}` +
-            `\n_Estimasi by Gemini 2.5 Flash_ 🤖\n\n` +
-            `━━━━━━━━━━━━━━\n` +
-            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-            `${remainingText}`,
+            `✅ *Makanan Tercatat!*\n\n` +
+            `📝 *${nutritionData.food_description}*\n` +
+            `🔥 Kalori: *${nutritionData.calories} kkal*\n` +
+            `📊 Sisa target: *${Math.round(remaining > 0 ? remaining : 0)} kkal*`,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
-                    inline_keyboard: [[
-                        { text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
-                        { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }
-                    ]]
+                    inline_keyboard: [[{ text: '💾 Simpan', callback_data: 'save_to_menu' }]]
                 }
             }
         );
-
     } catch (err) {
-        console.error(`[CatatHandler] Error for ${tgId}:`, err.message);
-        const errMsg = {
-            'RATE_LIMIT':   `⏳ Gemini overload. Tunggu ~1 menit ya!`,
-            'GEMINI_ERROR': `😵 Ada error. Coba lagi!`,
-        }[err.message] || `❌ Something went wrong. Coba lagi!`;
-
-        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
-            .catch(() => reply(ctx, errMsg));
+        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, `😵 Error!`);
     }
 }
 
@@ -1371,14 +1296,14 @@ async function handlePhotoContext(ctx, tgId, context) {
 }
 
 /**
- * Core: download foto + kirim ke Gemini + log hasilnya
- * Dipanggil dari handlePhotoContext atau callback skip
+ * Fungsi: processPhotoAnalysis
+ * Penjelasan: Alur utama buat proses foto. Setelah Gemini identifikasi nama makanan (Step 1), 
+ * data itu langsung dilempar ke Edamam (Step 2) buat dapet angka nutrisi yang valid.
  */
 async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     const user = await db.getUser(tgId);
-    photoContextMap.delete(tgId); // hapus dari memory
+    photoContextMap.delete(tgId);
 
-    // Loading message TANPA keyboard — biar bisa di-edit
     const loadingMsg = await ctx.reply(
         userContext
             ? `Sebentar ya... 🔍\n_Gemini analisis dengan konteks: "${userContext}"..._`
@@ -1388,7 +1313,8 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
 
     try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
-        const result      = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
+        // STEP 1: Gemini cuma buat deteksi visual (nama & porsi)
+        const result = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
 
         if (!result.is_food) {
             await ctx.telegram.editMessageText(
@@ -1398,63 +1324,67 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             return;
         }
 
-        // Simpan ke food_logs
+        // STEP 2: Grounding ke Edamam buat dapet angka presisi
+        let nutritionData;
+        let dataSource = '📊 _Data dari Edamam Database_';
+
+        try {
+            // Kita bungkus data porsi & nama dari Gemini ke array buat Edamam
+            const foodList = [{ name: result.food_description, portion: result.notes || '1 serving' }];
+            nutritionData = await edamam.getNutritionData(foodList);
+        } catch (err) {
+            console.warn(`[Edamam] Gagal, pakai estimasi AI: ${err.message}`);
+            nutritionData = result; // Fallback ke Gemini kalau API Edamam rewel
+            dataSource = '⚠️ _Data estimasi (Edamam limit/unavailable)_';
+        }
+
+        // Simpan ke database
         const savedLog = await db.insertFoodLog(tgId, {
-            food_description: result.food_description,
-            calories:  result.calories,
-            protein_g: result.protein_g,
-            carbs_g:   result.carbs_g,
-            fat_g:     result.fat_g,
-            gemini_raw: result.gemini_raw
+            food_description: nutritionData.food_description,
+            calories:  nutritionData.calories,
+            protein_g: nutritionData.protein_g,
+            carbs_g:   nutritionData.carbs_g,
+            fat_g:     nutritionData.fat_g,
+            gemini_raw: JSON.stringify(result) 
         });
 
-        // Simpan ke memory buat /adjust dan save menu
+        // Simpan ke memory buat fitur /adjust
         lastLogIdMap.set(tgId, savedLog.id);
-        lastResultMap.set(tgId, result); // simpan full result buat fitur save menu
+        lastResultMap.set(tgId, nutritionData);
 
         const summary   = await db.getDailySummary(tgId);
         const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
 
         const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-        const remainingText = remaining > 0
-            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+        const resultText = 
+            `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
+            `🍽️ *${nutritionData.food_description}*\n\n` +
+            `🔥 Kalori: *${nutritionData.calories} kkal*\n` +
+            `💪 Protein: *${nutritionData.protein_g}g*\n` +
+            `🍚 Karbo: *${nutritionData.carbs_g}g*\n` +
+            `🥑 Lemak: *${nutritionData.fat_g}g*\n` +
+            `\n${dataSource}\n\n` +
+            `━━━━━━━━━━━━━━\n` +
+            `📊 *Progress Hari Ini:*\n` +
+            `Sisa: *${Math.round(remaining > 0 ? remaining : 0)} kkal*`;
 
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
-            `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
-            `🍽️ *${result.food_description}*\n\n` +
-            `🔥 Kalori: *${result.calories} kkal*\n` +
-            `💪 Protein: *${result.protein_g}g*\n` +
-            `🍚 Karbo: *${result.carbs_g}g*\n` +
-            `🥑 Lemak: *${result.fat_g}g*\n` +
-            `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah, coba foto lebih jelas_\n' : ''}` +
-            `\n_Estimasi by Gemini 2.5 Flash_ 🤖\n\n` +
-            `━━━━━━━━━━━━━━\n` +
-            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-            `${remainingText}`,
+            resultText,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
-                    inline_keyboard: [[
-                        // Tombol simpan ke menu — muncul otomatis setelah analisis
-                        { text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
-                        { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }
-                    ]]
+                    inline_keyboard: [
+                        [{ text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
+                         { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }]
+                    ]
                 }
             }
         );
 
     } catch (err) {
-        console.error(`[PhotoHandler] Error for ${tgId}:`, err.message);
-        const errMsg = {
-            'RATE_LIMIT':   `⏳ Gemini overload. Tunggu ~1 menit ya!`,
-            'SAFETY_BLOCK': `🚫 Gambar gak bisa diproses.`,
-            'GEMINI_ERROR': `😵 Ada error. Coba kirim ulang!`,
-        }[err.message] || `❌ Something went wrong. Coba lagi!`;
-
-        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
-            .catch(() => reply(ctx, errMsg));
+        console.error(`[PhotoHandler] Error:`, err.message);
+        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, `❌ Ada error. Coba lagi!`);
     }
 }
 
