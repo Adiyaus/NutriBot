@@ -5,6 +5,7 @@
 
 const db     = require('../services/database');
 const gemini = require('../services/gemini');
+const usda   = require('../services/usda');
 const calc   = require('../utils/calculator');
 
 const lastLogIdMap    = new Map();
@@ -53,6 +54,23 @@ async function reply(ctx, text, extra = {}) {
         : { parse_mode: 'Markdown', ...MAIN_KEYBOARD, ...extra };       // inject main keyboard
 
     return ctx.reply(text, mergedExtra);
+}
+
+// ─── HELPER: SOURCE BADGE ────────────────────────────────────
+
+/**
+ * Build attribution badge berdasarkan data_source result
+ * Tampilkan ke user supaya tau data dari mana
+ */
+function buildSourceBadge(result) {
+    switch (result.data_source) {
+        case 'gemini_usda_merged':
+            return `_✅ Diverifikasi: Gemini + USDA FoodData (${result.usda_coverage})_ 🔬`;
+        case 'gemini_primary':
+            return `_⚡ Estimasi Gemini (USDA partial: ${result.usda_coverage})_ 🤖`;
+        default:
+            return `_Estimasi by Gemini 2.5 Flash_ 🤖`;
+    }
 }
 
 // ─── COMMAND HANDLERS ────────────────────────────────────────
@@ -622,10 +640,10 @@ async function handleCatat(ctx) {
 
     try {
         // Estimasi nutrisi dari teks — tanpa foto!
-        const result = await gemini.estimateNutritionFromText(foodInput);
+        const geminiResult = await gemini.estimateNutritionFromText(foodInput);
 
         // Kalau Gemini bilang bukan makanan
-        if (!result.is_food) {
+        if (!geminiResult.is_food) {
             await ctx.telegram.editMessageText(
                 ctx.chat.id, loadingMsg.message_id, null,
                 `Hmm, gua gak ngerti itu makanan apa... 🤔\n\n` +
@@ -633,6 +651,18 @@ async function handleCatat(ctx) {
                 `Contoh: \`/catat nasi goreng 1 porsi\``
             );
             return;
+        }
+
+        // 🔍 USDA enrichment — lookup tiap food item ke USDA FoodData Central
+        let result = geminiResult;
+        try {
+            if (geminiResult.food_items?.length > 0) {
+                const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
+                result = usda.reconcileResults(geminiResult, usdaItems);
+            }
+        } catch (usdaErr) {
+            console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
+            // fallback ke gemini result aja, jangan throw
         }
 
         // Simpan ke food_logs — sama persis kayak dari foto
@@ -668,7 +698,7 @@ async function handleCatat(ctx) {
             `🥑 Lemak: *${result.fat_g}g*\n` +
             `${result.notes ? `\n📌 _Asumsi: ${result.notes}_\n` : ''}` +
             `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah — coba tulis lebih detail_\n' : ''}` +
-            `\n_Estimasi by Gemini 2.5 Flash_ 🤖\n\n` +
+            `\n${buildSourceBadge(result)}\n\n` +
             `━━━━━━━━━━━━━━\n` +
             `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
             `${remainingText}`,
@@ -1388,14 +1418,25 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
 
     try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
-        const result      = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
+        const geminiResult = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
 
-        if (!result.is_food) {
+        if (!geminiResult.is_food) {
             await ctx.telegram.editMessageText(
                 ctx.chat.id, loadingMsg.message_id, null,
                 `Hmm, kayaknya bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya! 📸`
             );
             return;
+        }
+
+        // 🔍 USDA enrichment — verifikasi kalori dengan data database nutrisi USDA
+        let result = geminiResult;
+        try {
+            if (geminiResult.food_items?.length > 0) {
+                const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
+                result = usda.reconcileResults(geminiResult, usdaItems);
+            }
+        } catch (usdaErr) {
+            console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
         }
 
         // Simpan ke food_logs
@@ -1429,7 +1470,7 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             `🍚 Karbo: *${result.carbs_g}g*\n` +
             `🥑 Lemak: *${result.fat_g}g*\n` +
             `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah, coba foto lebih jelas_\n' : ''}` +
-            `\n_Estimasi by Gemini 2.5 Flash_ 🤖\n\n` +
+            `\n${buildSourceBadge(result)}\n\n` +
             `━━━━━━━━━━━━━━\n` +
             `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
             `${remainingText}`,

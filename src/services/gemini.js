@@ -153,12 +153,17 @@ ATURAN:
 - Identifikasi semua item makanan yang terlihat
 - Estimasi porsi berdasarkan visual (piring standar, mangkok biasa, dll)
 - Berikan estimasi nutrisi yang REALISTIS berdasarkan porsi tersebut
-- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia${contextLine}
+- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia
+- Di field food_items, pisahkan setiap komponen makanan dengan estimasi berat dalam gram${contextLine}
 
 Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
 {
   "is_food": true,
   "food_description": "deskripsi makanan dalam bahasa Indonesia, pisah dengan koma",
+  "food_items": [
+    {"name": "nama komponen dalam bahasa Inggris untuk lookup", "portion_g": estimasi_berat_gram},
+    {"name": "contoh: steamed white rice", "portion_g": 200}
+  ],
   "calories": angka_kalori_integer,
   "protein_g": angka_protein_satu_desimal,
   "carbs_g": angka_karbo_satu_desimal,
@@ -213,6 +218,10 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
 {
   "is_food": true,
   "food_description": "deskripsi lengkap + porsi yang diasumsikan, pisah koma",
+  "food_items": [
+    {"name": "nama komponen dalam bahasa Inggris untuk lookup", "portion_g": estimasi_berat_gram},
+    {"name": "contoh: fried rice", "portion_g": 300}
+  ],
   "calories": angka_kalori_integer,
   "protein_g": angka_protein_satu_desimal,
   "carbs_g": angka_karbo_satu_desimal,
@@ -267,6 +276,7 @@ function parseNutritionResponse(rawText) {
     return {
         is_food:          true,
         food_description: parsed.food_description || 'Makanan tidak teridentifikasi',
+        food_items:       Array.isArray(parsed.food_items) ? parsed.food_items : [], // ← buat USDA lookup
         calories:         Math.max(0, Math.round(Number(parsed.calories)  || 0)),
         protein_g:        Math.max(0, parseFloat((Number(parsed.protein_g) || 0).toFixed(1))),
         carbs_g:          Math.max(0, parseFloat((Number(parsed.carbs_g)   || 0).toFixed(1))),
