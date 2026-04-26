@@ -142,25 +142,25 @@ async function downloadImage(fileUrl) {
 // src/services/gemini.js
 
 async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContext = '') {
-    const prompt = `
-Kamu adalah food analyst profesional. Lihat gambar ini dan identifikasi isinya.
+    // src/services/gemini.js
+const prompt = `
+Identifikasi makanan dari foto ini untuk dihitung kalorinya via API.
 
-ATURAN:
-1. Identifikasi tiap item makanan/minuman yang terlihat.
-2. Buat estimasi porsi yang masuk akal.
-3. Untuk field "items_for_api", gunakan Bahasa Inggris (karena API hanya paham Inggris).
-4. Untuk field "food_description", gunakan Bahasa Indonesia yang santai.
+ATURAN WAJIB:
+1. List semua makanan di field "items_for_api" dalam BAHASA INGGRIS.
+2. Gunakan unit standar (gram, piece, atau cup) agar API tidak error. 
+   Contoh: "200g Steamed Rice", "1 piece Fried Chicken". JANGAN PAKAI "bowl" atau "piring".
+3. Field "food_description" pakai Bahasa Indonesia yang santai buat user.
 
-Balas HANYA JSON ini:
+Balas HANYA JSON:
 {
   "is_food": true,
-  "food_description": "deskripsi ringkas dalam Bahasa Indonesia",
+  "food_description": "Deskripsi Indo lo di sini",
   "items_for_api": [
-    { "name": "food name in English", "portion": "quantity, e.g. 100g, 1 piece, 1 bowl" }
-  ],
-  "confidence": "high/medium/low"
+    { "name": "food name", "portion": "weight in grams or pieces" }
+  ]
 }
-    `.trim();
+`.trim();
 
     try {
         const base64Image = imageBuffer.toString('base64');
