@@ -7,6 +7,7 @@ const db     = require('../services/database');
 const gemini = require('../services/gemini');
 const usda   = require('../services/usda');
 const calc   = require('../utils/calculator');
+const off    = require('../services/openfoodfacts');
 
 const lastLogIdMap    = new Map();
 const lastResultMap   = new Map();
@@ -64,6 +65,8 @@ async function reply(ctx, text, extra = {}) {
  */
 function buildSourceBadge(result) {
     switch (result.data_source) {
+        case 'openfoodfacts':
+            return `_✅ Data resmi kemasan via OpenFoodFacts_ 📦`;
         case 'gemini_usda_merged':
             return `_✅ Diverifikasi: Gemini + USDA FoodData (${result.usda_coverage})_ 🔬`;
         case 'gemini_primary':
@@ -1412,31 +1415,71 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     const loadingMsg = await ctx.reply(
         userContext
             ? `Sebentar ya... 🔍\n_Gemini analisis dengan konteks: "${userContext}"..._`
-            : `Sebentar ya... 🔍\n_Gemini lagi analisis makanannya..._`,
+            : `Sebentar ya... 🔍\n_Cek barcode & analisis makanan..._`,
         { parse_mode: 'Markdown' }
     );
 
     try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
-        const geminiResult = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
 
-        if (!geminiResult.is_food) {
-            await ctx.telegram.editMessageText(
-                ctx.chat.id, loadingMsg.message_id, null,
-                `Hmm, kayaknya bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya! 📸`
-            );
-            return;
+        // ─── STEP 1: Coba deteksi barcode dulu (hemat token!) ───
+        let result = null;
+        let usedBarcode = false;
+
+        try {
+            const barcodeDetection = await gemini.detectBarcode(imageBuffer, 'image/jpeg');
+
+            if (barcodeDetection.found) {
+                // Edit loading message biar user tau lagi cek barcode
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id, loadingMsg.message_id, null,
+                    `🔍 Barcode terdeteksi! Cek database OpenFoodFacts...`,
+                    { parse_mode: 'Markdown' }
+                ).catch(() => {}); // ignore kalau edit gagal
+
+                const offResult = await off.lookupBarcode(barcodeDetection.barcode);
+
+                if (offResult?.found) {
+                    result = off.toNutriFormat(offResult);
+                    usedBarcode = true;
+                    console.log(`[PhotoHandler] ✅ Barcode hit: ${barcodeDetection.barcode} → ${result.food_description}`);
+                } else {
+                    // Barcode ketemu tapi tidak ada di OpenFoodFacts → fallback ke Gemini
+                    console.log(`[PhotoHandler] Barcode ${barcodeDetection.barcode} tidak ada di OFF, fallback ke Gemini`);
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id, loadingMsg.message_id, null,
+                        `Sebentar ya... 🔍\n_Produk tidak ditemukan di database, Gemini analisis langsung..._`,
+                        { parse_mode: 'Markdown' }
+                    ).catch(() => {});
+                }
+            }
+        } catch (barcodeErr) {
+            // Deteksi barcode gagal → lanjut ke Gemini vision biasa
+            console.warn('[PhotoHandler] Barcode detection error, fallback:', barcodeErr.message);
         }
 
-        // 🔍 USDA enrichment — verifikasi kalori dengan data database nutrisi USDA
-        let result = geminiResult;
-        try {
-            if (geminiResult.food_items?.length > 0) {
-                const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
-                result = usda.reconcileResults(geminiResult, usdaItems);
+        // ─── STEP 2: Fallback ke Gemini Vision kalau barcode gagal/tidak ketemu ───
+        if (!result) {
+            const geminiResult = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
+
+            if (!geminiResult.is_food) {
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id, loadingMsg.message_id, null,
+                    `Hmm, kayaknya bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya! 📸`
+                );
+                return;
             }
-        } catch (usdaErr) {
-            console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
+
+            // 🔍 USDA enrichment — verifikasi kalori dengan data database nutrisi USDA
+            result = geminiResult;
+            try {
+                if (geminiResult.food_items?.length > 0) {
+                    const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
+                    result = usda.reconcileResults(geminiResult, usdaItems);
+                }
+            } catch (usdaErr) {
+                console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
+            }
         }
 
         // Simpan ke food_logs
@@ -1464,8 +1507,11 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
             `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
-            `🍽️ *${result.food_description}*\n\n` +
-            `🔥 Kalori: *${result.calories} kkal*\n` +
+            `🍽️ *${result.food_description}*\n` +
+            (usedBarcode && result.off_data?.serving_size
+                ? `_Ukuran sajian: ${result.off_data.serving_size}_\n`
+                : '') +
+            `\n🔥 Kalori: *${result.calories} kkal*\n` +
             `💪 Protein: *${result.protein_g}g*\n` +
             `🍚 Karbo: *${result.carbs_g}g*\n` +
             `🥑 Lemak: *${result.fat_g}g*\n` +

@@ -398,9 +398,63 @@ Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
     }
 }
 
+// ─── BARCODE DETECTION ────────────────────────────────────────
+
+/**
+ * Deteksi barcode dari gambar menggunakan Gemini Vision
+ * Lebih hemat token daripada full food analysis — prompt singkat, response minimal
+ *
+ * @param {Buffer} imageBuffer - buffer gambar
+ * @param {string} mimeType    - MIME type gambar (default: 'image/jpeg')
+ * @returns {{ found: boolean, barcode: string|null }} hasil deteksi barcode
+ */
+async function detectBarcode(imageBuffer, mimeType = 'image/jpeg') {
+    const prompt = `Look at this image. Is there a barcode (EAN-13, EAN-8, QR code, UPC, or similar product barcode) visible?
+
+If YES: Reply ONLY with the exact barcode number, nothing else. Example: 8996001303603
+If NO barcode visible, or if you cannot read it clearly: Reply ONLY with the word: NONE
+
+Do not add any explanation, spaces, or extra text.`;
+
+    try {
+        const base64Image = imageBuffer.toString('base64');
+
+        const rawText = await callGemini([{
+            role: 'user',
+            parts: [
+                { text: prompt },
+                { inlineData: { mimeType, data: base64Image } }
+            ]
+        }]);
+
+        const result = rawText.trim().replace(/\s/g, '');
+
+        // Kalau "NONE" atau string kosong → tidak ada barcode
+        if (!result || result.toUpperCase() === 'NONE') {
+            return { found: false, barcode: null };
+        }
+
+        // Validasi basic: barcode hanya berisi angka, panjang 8-14 digit
+        const isValidBarcode = /^\d{8,14}$/.test(result);
+        if (!isValidBarcode) {
+            console.log(`[Gemini] Barcode deteksi tidak valid: "${result}"`);
+            return { found: false, barcode: null };
+        }
+
+        console.log(`[Gemini] Barcode terdeteksi: ${result}`);
+        return { found: true, barcode: result };
+
+    } catch (err) {
+        // Kalau deteksi gagal, jangan throw — fallback ke Gemini food analysis
+        console.warn('[Gemini] detectBarcode error:', err.message);
+        return { found: false, barcode: null };
+    }
+}
+
 module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
     generateCoachAnswer,
-    downloadImage
+    downloadImage,
+    detectBarcode
 };
