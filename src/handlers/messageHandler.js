@@ -67,6 +67,10 @@ function buildSourceBadge(result) {
     switch (result.data_source) {
         case 'openfoodfacts':
             return `_✅ Data resmi kemasan via OpenFoodFacts_ 📦`;
+        case 'usda_primary':
+            return `_✅ Kalori dari USDA FoodData (${result.usda_coverage})_ 🔬`;
+        case 'usda_partial':
+            return `_⚡ USDA sebagian (${result.usda_coverage}) + estimasi Gemini_ 🔬`;
         case 'gemini_usda_merged':
             return `_✅ Diverifikasi: Gemini + USDA FoodData (${result.usda_coverage})_ 🔬`;
         case 'gemini_primary':

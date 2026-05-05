@@ -83,7 +83,12 @@ async function callGemini(contents) {
             const client   = getClient();
             const response = await client.models.generateContent({
                 model: 'gemini-2.5-flash-lite',
-                contents
+                contents,
+                config: {
+                    temperature:     0.1,  // rendah = lebih deterministik, kurangi variasi
+                    topP:            0.8,
+                    responseMimeType: 'application/json',  // paksa output JSON murni
+                }
             });
             return response.text; // sukses → return langsung
 
@@ -146,31 +151,43 @@ async function analyzeFoodImage(imageBuffer, mimeType = 'image/jpeg', userContex
         : '';
 
     const prompt = `
-Kamu adalah ahli nutrisi profesional. Analisis gambar makanan ini secara detail.
+Kamu adalah database nutrisi. Tugasmu: identifikasi makanan dan estimasi BERAT FISIK (gram) tiap komponen.
+Kalori akan dihitung dari database eksternal — fokus lo HANYA pada identifikasi dan estimasi berat yang akurat.
+
+STANDAR REFERENSI BERAT (gunakan ini sebagai acuan konsisten):
+- Nasi putih 1 centong = 100g, 1 piring = 200g, 1 mangkok = 250g
+- Ayam goreng 1 potong paha = 80g, dada = 100g
+- Mie instan 1 bungkus = 85g (kering)
+- Roti tawar 1 lembar = 30g
+- Telur 1 butir = 55g
+- Tempe 1 potong persegi 5cm = 30g, 1 papan = 250g
+- Tahu 1 potong sedang = 80g
+- Sayuran tumis 1 porsi = 50g
+- Sambal/saus 1 sendok = 15g
 
 ATURAN:
-- Kalau BUKAN makanan/minuman, set is_food: false dan semua angka ke 0
-- Identifikasi semua item makanan yang terlihat
-- Estimasi porsi berdasarkan visual (piring standar, mangkok biasa, dll)
-- Berikan estimasi nutrisi yang REALISTIS berdasarkan porsi tersebut
-- Untuk makanan Indonesia, gunakan referensi porsi umum Indonesia
-- Di field food_items, pisahkan setiap komponen makanan dengan estimasi berat dalam gram${contextLine}
+- Kalau BUKAN makanan/minuman, set is_food: false
+- Sebutkan TIAP komponen secara terpisah dalam food_items (nasi, lauk, sayur — dipisah)
+- Nama di food_items WAJIB bahasa Inggris (untuk database lookup)
+- Estimasi berat harus SPESIFIK angka, bukan range${contextLine}
 
-Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
+Balas HANYA JSON ini:
 {
   "is_food": true,
-  "food_description": "deskripsi makanan dalam bahasa Indonesia, pisah dengan koma",
+  "food_description": "deskripsi dalam bahasa Indonesia",
   "food_items": [
-    {"name": "nama komponen dalam bahasa Inggris untuk lookup", "portion_g": estimasi_berat_gram},
-    {"name": "contoh: steamed white rice", "portion_g": 200}
+    {"name": "steamed white rice", "portion_g": 200},
+    {"name": "fried chicken thigh", "portion_g": 80}
   ],
-  "calories": angka_kalori_integer,
-  "protein_g": angka_protein_satu_desimal,
-  "carbs_g": angka_karbo_satu_desimal,
-  "fat_g": angka_lemak_satu_desimal,
+  "calories": 0,
+  "protein_g": 0,
+  "carbs_g": 0,
+  "fat_g": 0,
   "confidence": "high/medium/low",
-  "notes": "catatan singkat estimasi porsi kalau perlu"
+  "notes": "referensi ukuran yang dipakai (contoh: nasi 1 piring = 200g)"
 }
+
+PENTING: Set calories/protein_g/carbs_g/fat_g ke 0 — nilai ini akan diambil dari database, bukan estimasi lo.
     `.trim();
 
     try {
@@ -203,31 +220,42 @@ Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
  */
 async function estimateNutritionFromText(foodText) {
     const prompt = `
-Kamu adalah ahli nutrisi profesional yang hafal kandungan gizi berbagai makanan.
+Kamu adalah database nutrisi. Tugasmu: parse deskripsi makanan menjadi komponen + berat gram yang akurat.
+Kalori akan dihitung dari database eksternal — fokus lo HANYA pada identifikasi dan estimasi berat.
+
+STANDAR REFERENSI BERAT (gunakan ini sebagai acuan konsisten):
+- Nasi putih 1 centong = 100g, 1 piring = 200g, 1 mangkok = 250g
+- Ayam goreng 1 potong paha = 80g, dada = 100g
+- Mie instan 1 bungkus = 85g (kering)
+- Roti tawar 1 lembar = 30g
+- Telur 1 butir = 55g
+- Tempe 1 potong persegi 5cm = 30g, 1 papan = 250g
+- Tahu 1 potong sedang = 80g
+- Sayuran tumis 1 porsi = 50g
 
 User makan: "${foodText}"
 
-TUGASMU:
-- Estimasi kandungan nutrisi makanan yang disebutkan
-- Kalau porsi tidak disebutkan, gunakan porsi standar Indonesia
-- Kalau bukan makanan/minuman sama sekali, set is_food: false
-- Untuk makanan kemasan (indomie, pocari, dll), gunakan data nutrisi yang akurat
-- Gabungkan semua item jadi total keseluruhan
+ATURAN:
+- Kalau bukan makanan sama sekali, set is_food: false
+- Pisahkan tiap komponen dalam food_items, nama WAJIB bahasa Inggris
+- Kalau ada berat/ukuran eksplisit dari user, pakai itu — jangan ubah
+- Kalau tidak ada ukuran, pakai standar referensi di atas
+- Set calories/protein_g/carbs_g/fat_g ke 0 (akan dihitung dari database)
 
-Balas HANYA JSON ini (tanpa markdown, tanpa teks lain):
+Balas HANYA JSON ini:
 {
   "is_food": true,
-  "food_description": "deskripsi lengkap + porsi yang diasumsikan, pisah koma",
+  "food_description": "deskripsi + porsi yang dipakai, dalam bahasa Indonesia",
   "food_items": [
-    {"name": "nama komponen dalam bahasa Inggris untuk lookup", "portion_g": estimasi_berat_gram},
-    {"name": "contoh: fried rice", "portion_g": 300}
+    {"name": "steamed white rice", "portion_g": 200},
+    {"name": "fried egg", "portion_g": 55}
   ],
-  "calories": angka_kalori_integer,
-  "protein_g": angka_protein_satu_desimal,
-  "carbs_g": angka_karbo_satu_desimal,
-  "fat_g": angka_lemak_satu_desimal,
+  "calories": 0,
+  "protein_g": 0,
+  "carbs_g": 0,
+  "fat_g": 0,
   "confidence": "high/medium/low",
-  "notes": "asumsi porsi yang dipakai kalau user tidak specify"
+  "notes": "ukuran yang diasumsikan untuk tiap komponen"
 }
     `.trim();
 

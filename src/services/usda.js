@@ -154,57 +154,129 @@ async function lookupMultipleFoods(items) {
 
 /**
  * Gabungkan hasil Gemini dengan data USDA
- * Strategi:
- * - Kalau USDA berhasil: weighted average (60% USDA, 40% Gemini) → lebih reliable
- * - Kalau USDA gagal/partial: fallback ke Gemini murni
  *
- * @param {object} geminiResult     - hasil dari gemini.estimateNutritionFromText / analyzeFoodImage
- * @param {Array}  usdaItems        - hasil dari lookupMultipleFoods
- * @returns {object} merged result
+ * Strategi baru (USDA as primary source of truth):
+ * - USDA ≥ 70% coverage → pakai USDA murni, Gemini hanya untuk item yang tidak ketemu
+ * - USDA 30-70% coverage → USDA untuk item yang ketemu + Gemini untuk sisanya (additive, bukan average)
+ * - USDA < 30% coverage  → fallback ke Gemini, tapi tetap pakai USDA untuk item yang ketemu
+ *
+ * KENAPA bukan weighted average lagi:
+ * - Average 60/40 berarti kalori USDA yang akurat masih "dikotori" estimasi Gemini
+ * - Kalau USDA ketemu "steamed rice 200g = 260 kkal", itu angka fixed — tidak perlu di-average
+ * - Weighted average justru menambah inkonsistensi karena Gemini bisa berbeda tiap request
+ *
+ * @param {object} geminiResult - hasil dari gemini.estimateNutritionFromText / analyzeFoodImage
+ * @param {Array}  usdaItems    - hasil dari lookupMultipleFoods
+ * @returns {object} merged result dengan data_source yang menjelaskan strategi yang dipakai
  */
 function reconcileResults(geminiResult, usdaItems) {
     if (!usdaItems || usdaItems.length === 0) {
         return { ...geminiResult, data_source: 'gemini_only' };
     }
 
-    const foundItems  = usdaItems.filter(i => i.usda_found);
+    const foundItems    = usdaItems.filter(i => i.usda_found);
+    const missingItems  = usdaItems.filter(i => !i.usda_found);
     const coverageRatio = foundItems.length / usdaItems.length;
 
-    // Kalau kurang dari 50% item ditemukan USDA, trust Gemini lebih
-    if (coverageRatio < 0.5) {
-        return { ...geminiResult, data_source: 'gemini_primary', usda_partial: true };
+    // ── Kasus 1: USDA coverage bagus (≥ 70%) ────────────────
+    // Pakai USDA sebagai primary — kalori dari database, bukan AI
+    if (coverageRatio >= 0.7) {
+        const usdaTotal = foundItems.reduce((acc, item) => ({
+            calories:  acc.calories  + (item.calories  || 0),
+            protein_g: acc.protein_g + (item.protein_g || 0),
+            carbs_g:   acc.carbs_g   + (item.carbs_g   || 0),
+            fat_g:     acc.fat_g     + (item.fat_g     || 0),
+        }), { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
+
+        // Kalau ada item yang tidak ketemu USDA, estimasi proporsinya dari Gemini
+        // Misal: 3 item ketemu, 1 tidak → item yang tidak ketemu ≈ 25% dari total Gemini
+        let missingEstimate = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
+        if (missingItems.length > 0) {
+            const missingRatio = missingItems.length / usdaItems.length;
+            missingEstimate = {
+                calories:  Math.round(geminiResult.calories  * missingRatio),
+                protein_g: parseFloat((geminiResult.protein_g * missingRatio).toFixed(1)),
+                carbs_g:   parseFloat((geminiResult.carbs_g   * missingRatio).toFixed(1)),
+                fat_g:     parseFloat((geminiResult.fat_g      * missingRatio).toFixed(1)),
+            };
+        }
+
+        return {
+            ...geminiResult,
+            calories:  Math.round(usdaTotal.calories  + missingEstimate.calories),
+            protein_g: parseFloat((usdaTotal.protein_g + missingEstimate.protein_g).toFixed(1)),
+            carbs_g:   parseFloat((usdaTotal.carbs_g   + missingEstimate.carbs_g).toFixed(1)),
+            fat_g:     parseFloat((usdaTotal.fat_g      + missingEstimate.fat_g).toFixed(1)),
+            data_source:      'usda_primary',
+            usda_coverage:    `${foundItems.length}/${usdaItems.length} item`,
+            usda_items_found: foundItems.map(i => i.usda_desc),
+            confidence:       'high',
+        };
     }
 
-    // Hitung total dari USDA
-    const usdaTotal = foundItems.reduce((acc, item) => ({
-        calories:  acc.calories  + (item.calories  || 0),
-        protein_g: acc.protein_g + (item.protein_g || 0),
-        carbs_g:   acc.carbs_g   + (item.carbs_g   || 0),
-        fat_g:     acc.fat_g     + (item.fat_g     || 0),
-    }), { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
+    // ── Kasus 2: USDA coverage partial (30-70%) ───────────────
+    // Additive: item yang ketemu pakai USDA, item yang tidak pakai proporsi Gemini
+    if (coverageRatio >= 0.3) {
+        const usdaSubtotal = foundItems.reduce((acc, item) => ({
+            calories:  acc.calories  + (item.calories  || 0),
+            protein_g: acc.protein_g + (item.protein_g || 0),
+            carbs_g:   acc.carbs_g   + (item.carbs_g   || 0),
+            fat_g:     acc.fat_g     + (item.fat_g     || 0),
+        }), { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
 
-    // Weighted average: 60% USDA + 40% Gemini
-    // → hasil lebih stabil, gak murni satu sumber
-    const w_usda   = 0.6;
-    const w_gemini = 0.4;
+        const missingRatio = missingItems.length / usdaItems.length;
+        const geminiForMissing = {
+            calories:  Math.round(geminiResult.calories  * missingRatio),
+            protein_g: parseFloat((geminiResult.protein_g * missingRatio).toFixed(1)),
+            carbs_g:   parseFloat((geminiResult.carbs_g   * missingRatio).toFixed(1)),
+            fat_g:     parseFloat((geminiResult.fat_g      * missingRatio).toFixed(1)),
+        };
 
-    const merged = {
-        ...geminiResult,
-        calories:  Math.round(usdaTotal.calories  * w_usda + geminiResult.calories  * w_gemini),
-        protein_g: parseFloat((usdaTotal.protein_g * w_usda + geminiResult.protein_g * w_gemini).toFixed(1)),
-        carbs_g:   parseFloat((usdaTotal.carbs_g   * w_usda + geminiResult.carbs_g   * w_gemini).toFixed(1)),
-        fat_g:     parseFloat((usdaTotal.fat_g      * w_usda + geminiResult.fat_g     * w_gemini).toFixed(1)),
+        return {
+            ...geminiResult,
+            calories:  Math.round(usdaSubtotal.calories  + geminiForMissing.calories),
+            protein_g: parseFloat((usdaSubtotal.protein_g + geminiForMissing.protein_g).toFixed(1)),
+            carbs_g:   parseFloat((usdaSubtotal.carbs_g   + geminiForMissing.carbs_g).toFixed(1)),
+            fat_g:     parseFloat((usdaSubtotal.fat_g      + geminiForMissing.fat_g).toFixed(1)),
+            data_source:      'usda_partial',
+            usda_coverage:    `${foundItems.length}/${usdaItems.length} item`,
+            usda_items_found: foundItems.map(i => i.usda_desc),
+            confidence:       geminiResult.confidence === 'low' ? 'medium' : geminiResult.confidence,
+        };
+    }
 
-        // Metadata sumber data
-        data_source:       'gemini_usda_merged',
-        usda_coverage:     `${foundItems.length}/${usdaItems.length} item`,
-        usda_items_found:  foundItems.map(i => i.usda_desc),
+    // ── Kasus 3: USDA coverage buruk (< 30%) ─────────────────
+    // Fallback ke Gemini, tapi tetap pakai USDA untuk item yang ketemu (bukan average)
+    if (foundItems.length > 0) {
+        const usdaSubtotal = foundItems.reduce((acc, item) => ({
+            calories:  acc.calories  + (item.calories  || 0),
+            protein_g: acc.protein_g + (item.protein_g || 0),
+            carbs_g:   acc.carbs_g   + (item.carbs_g   || 0),
+            fat_g:     acc.fat_g     + (item.fat_g     || 0),
+        }), { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
 
-        // Naikkan confidence kalau USDA support Gemini
-        confidence: geminiResult.confidence === 'low' ? 'medium' : 'high',
-    };
+        const missingRatio = missingItems.length / usdaItems.length;
+        const geminiForMissing = {
+            calories:  Math.round(geminiResult.calories  * missingRatio),
+            protein_g: parseFloat((geminiResult.protein_g * missingRatio).toFixed(1)),
+            carbs_g:   parseFloat((geminiResult.carbs_g   * missingRatio).toFixed(1)),
+            fat_g:     parseFloat((geminiResult.fat_g      * missingRatio).toFixed(1)),
+        };
 
-    return merged;
+        return {
+            ...geminiResult,
+            calories:  Math.round(usdaSubtotal.calories  + geminiForMissing.calories),
+            protein_g: parseFloat((usdaSubtotal.protein_g + geminiForMissing.protein_g).toFixed(1)),
+            carbs_g:   parseFloat((usdaSubtotal.carbs_g   + geminiForMissing.carbs_g).toFixed(1)),
+            fat_g:     parseFloat((usdaSubtotal.fat_g      + geminiForMissing.fat_g).toFixed(1)),
+            data_source:   'gemini_primary',
+            usda_coverage: `${foundItems.length}/${usdaItems.length} item`,
+            confidence:    geminiResult.confidence,
+        };
+    }
+
+    // Tidak ada USDA sama sekali → Gemini murni
+    return { ...geminiResult, data_source: 'gemini_only', usda_coverage: '0/0 item' };
 }
 
 module.exports = {
