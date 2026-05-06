@@ -1419,51 +1419,16 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     const loadingMsg = await ctx.reply(
         userContext
             ? `Sebentar ya... 🔍\n_Gemini analisis dengan konteks: "${userContext}"..._`
-            : `Sebentar ya... 🔍\n_Cek barcode & analisis makanan..._`,
+            : `Sebentar ya... 🔍\n_Analisis makanan..._`,
         { parse_mode: 'Markdown' }
     );
 
     try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
 
-        // ─── STEP 1: Coba deteksi barcode dulu (hemat token!) ───
+        // ─── Gemini Vision: identifikasi makanan + berat ───
         let result = null;
-        let usedBarcode = false;
-
-        try {
-            const barcodeDetection = await gemini.detectBarcode(imageBuffer, 'image/jpeg');
-
-            if (barcodeDetection.found) {
-                // Edit loading message biar user tau lagi cek barcode
-                await ctx.telegram.editMessageText(
-                    ctx.chat.id, loadingMsg.message_id, null,
-                    `🔍 Barcode terdeteksi! Cek database OpenFoodFacts...`,
-                    { parse_mode: 'Markdown' }
-                ).catch(() => {}); // ignore kalau edit gagal
-
-                const offResult = await off.lookupBarcode(barcodeDetection.barcode);
-
-                if (offResult?.found) {
-                    result = off.toNutriFormat(offResult);
-                    usedBarcode = true;
-                    console.log(`[PhotoHandler] ✅ Barcode hit: ${barcodeDetection.barcode} → ${result.food_description}`);
-                } else {
-                    // Barcode ketemu tapi tidak ada di OpenFoodFacts → fallback ke Gemini
-                    console.log(`[PhotoHandler] Barcode ${barcodeDetection.barcode} tidak ada di OFF, fallback ke Gemini`);
-                    await ctx.telegram.editMessageText(
-                        ctx.chat.id, loadingMsg.message_id, null,
-                        `Sebentar ya... 🔍\n_Produk tidak ditemukan di database, Gemini analisis langsung..._`,
-                        { parse_mode: 'Markdown' }
-                    ).catch(() => {});
-                }
-            }
-        } catch (barcodeErr) {
-            // Deteksi barcode gagal → lanjut ke Gemini vision biasa
-            console.warn('[PhotoHandler] Barcode detection error, fallback:', barcodeErr.message);
-        }
-
-        // ─── STEP 2: Fallback ke Gemini Vision kalau barcode gagal/tidak ketemu ───
-        if (!result) {
+        {
             const geminiResult = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
 
             if (!geminiResult.is_food) {
@@ -1512,9 +1477,7 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             ctx.chat.id, loadingMsg.message_id, null,
             `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
             `🍽️ *${result.food_description}*\n` +
-            (usedBarcode && result.off_data?.serving_size
-                ? `_Ukuran sajian: ${result.off_data.serving_size}_\n`
-                : '') +
+
             `\n🔥 Kalori: *${result.calories} kkal*\n` +
             `💪 Protein: *${result.protein_g}g*\n` +
             `🍚 Karbo: *${result.carbs_g}g*\n` +

@@ -426,80 +426,10 @@ Balas HANYA teks jawabannya saja, tanpa label atau prefix apapun.
     }
 }
 
-// ─── BARCODE DETECTION (lokal, 0 Gemini call) ────────────────
-
-/**
- * Deteksi barcode dari gambar menggunakan @zxing/library + Jimp — TANPA Gemini.
- * Hemat API call: sebelumnya setiap foto = 2 Gemini calls, sekarang = 1 Gemini call.
- *
- * Flow:
- *   imageBuffer → Jimp decode → pixel array → ZXing scan → barcode string
- *
- * Kalau library gagal (format tidak support, gambar buram, dll) → return found: false
- * supaya caller bisa fallback ke food analysis seperti biasa.
- *
- * @param {Buffer} imageBuffer - buffer gambar (JPEG/PNG/dll)
- * @returns {{ found: boolean, barcode: string|null }}
- */
-async function detectBarcode(imageBuffer) {
-    try {
-        const Jimp = require('jimp');
-        const { MultiFormatReader, RGBLuminanceSource, BinaryBitmap, HybridBinarizer, DecodeHintType, BarcodeFormat } = require('@zxing/library');
-
-        // Decode gambar ke pixel array via Jimp
-        const image = await Jimp.read(imageBuffer);
-        const { width, height } = image.bitmap;
-
-        // ZXing butuh Uint8ClampedArray RGBA
-        const pixels = new Uint8ClampedArray(image.bitmap.data);
-
-        // Setup ZXing reader — scan semua format barcode umum
-        const hints = new Map();
-        hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-            BarcodeFormat.EAN_13,
-            BarcodeFormat.EAN_8,
-            BarcodeFormat.UPC_A,
-            BarcodeFormat.UPC_E,
-            BarcodeFormat.CODE_128,
-            BarcodeFormat.CODE_39,
-            BarcodeFormat.QR_CODE,
-            BarcodeFormat.DATA_MATRIX,
-        ]);
-        hints.set(DecodeHintType.TRY_HARDER, true); // scan lebih agresif untuk gambar miring/buram
-
-        const luminanceSource = new RGBLuminanceSource(pixels, width, height);
-        const binaryBitmap    = new BinaryBitmap(new HybridBinarizer(luminanceSource));
-        const reader          = new MultiFormatReader();
-        reader.setHints(hints);
-
-        const result  = reader.decode(binaryBitmap);
-        const barcode = result.getText().trim().replace(/\s/g, '');
-
-        // Validasi: barcode produk umumnya 8-14 digit angka
-        const isValidBarcode = /^\d{8,14}$/.test(barcode);
-        if (!isValidBarcode) {
-            console.log(`[Barcode] Hasil tidak valid: "${barcode}"`);
-            return { found: false, barcode: null };
-        }
-
-        console.log(`[Barcode] Terdeteksi (lokal): ${barcode}`);
-        return { found: true, barcode };
-
-    } catch (err) {
-        // NotFoundException = tidak ada barcode di gambar — ini normal, bukan error
-        if (err?.name === 'NotFoundException' || err?.message?.includes('No MultiFormat')) {
-            return { found: false, barcode: null };
-        }
-        // Error lain (format gambar aneh, OOM, dll) — log tapi tetap fallback
-        console.warn('[Barcode] Scan error:', err.message);
-        return { found: false, barcode: null };
-    }
-}
 
 module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
     generateCoachAnswer,
-    downloadImage,
-    detectBarcode
+    downloadImage
 };
