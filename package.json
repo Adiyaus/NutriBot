@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "setup-webhook": "node scripts/set-webhook.js"
   },
   "engines": {
     "node": ">=18.0.0"

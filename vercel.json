@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "functions": {
+    "api/webhook.js": {
+      "maxDuration": 30
+    },
+    "api/cron-reminder.js": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron-reminder",
+      "schedule": "* * * * *"
+    }
+  ]
+}
