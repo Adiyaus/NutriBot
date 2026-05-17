@@ -3,7 +3,7 @@
 // Entry point untuk Vercel — handle update dari Telegram via webhook
 // Gak pakai bot.launch() karena Vercel serverless, proses mati setelah request
 // ============================================================
-
+console.log('[DEBUG] USDA_API_KEY:', process.env.USDA_API_KEY ? 'ADA' : 'TIDAK ADA');
 const { Telegraf } = require('telegraf');
 const { initReminder } = require('../src/services/reminder');
 
