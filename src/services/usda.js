@@ -17,9 +17,10 @@ const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
  *
  * @param {string} query        - nama makanan (contoh: "nasi goreng", "fried rice")
  * @param {number} [maxResults] - jumlah hasil yang dikembalikan (default: 3)
+ * @param {number} [retries]    - jumlah retry kalau gagal (default: 1)
  * @returns {Array} array of { fdcId, description, calories_per100g, protein_per100g, carbs_per100g, fat_per100g }
  */
-async function searchFood(query, maxResults = 3) {
+async function searchFood(query, maxResults = 3, retries = 1) {
     const apiKey = process.env.USDA_API_KEY;
     if (!apiKey) {
         console.warn('[USDA] API key tidak ditemukan, skip USDA lookup');
@@ -37,7 +38,12 @@ async function searchFood(query, maxResults = 3) {
             timeout: 8000
         });
 
-        const foods = response.data?.foods || [];
+        // Kalau dapat HTML bukan JSON (redirect ke halaman web USDA), anggap gagal
+        if (typeof response.data !== 'object' || !response.data?.foods) {
+            throw new Error('Response bukan JSON valid — kemungkinan kena redirect');
+        }
+
+        const foods = response.data.foods || [];
         if (foods.length === 0) return [];
 
         return foods.map(food => {
@@ -60,6 +66,11 @@ async function searchFood(query, maxResults = 3) {
         }).filter(f => f.calories_per100g !== null); // filter kalau gak ada data kalori
 
     } catch (err) {
+        if (retries > 0) {
+            console.warn(`[USDA] Gagal, retry dalam 1s... (sisa retry: ${retries})`);
+            await new Promise(r => setTimeout(r, 1000));
+            return searchFood(query, maxResults, retries - 1);
+        }
         console.error('[USDA] Search error:', err.response?.data || err.message);
         return []; // gagal → return empty, jangan throw (fallback ke Gemini aja)
     }
