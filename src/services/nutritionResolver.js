@@ -20,7 +20,7 @@
 // ============================================================
 
 const { normalizeFood, buildSearchQueries } = require('../utils/normalizeFood');
-const { applyGeminiBias }                   = require('../utils/geminiCalorieBias');
+const { applyGeminiBias }                   = require('../utils/geminicaloriebias');
 const cache  = require('./nutritionCache');
 const usda   = require('./usda');
 const off    = require('./openfoodfacts');
