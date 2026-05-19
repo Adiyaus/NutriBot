@@ -1,30 +1,33 @@
 // ============================================================
 // src/services/openfoodfacts.js
-// OpenFoodFacts API — lookup nutrisi dari barcode produk kemasan
+// OpenFoodFacts API — barcode lookup + name search
 // Docs: https://world.openfoodfacts.org/data
 // Free, no API key needed!
+//
+// CHANGELOG:
+//   + searchByName()    → lookup by food name (buat fallback chain)
+//   ~ lookup timeout diperpendek (6s → 5s) biar Vercel gak nunggu lama
 // ============================================================
 
 const axios = require('axios');
 
-const OFF_BASE_URL = 'https://world.openfoodfacts.org/api/v2';
+const OFF_BASE_URL      = 'https://world.openfoodfacts.org/api/v2';
+const OFF_SEARCH_URL    = 'https://world.openfoodfacts.org/cgi/search.pl';
+const REQUEST_TIMEOUT   = 5000; // lebih pendek → fail fast ke layer berikutnya
 
-// Timeout lebih pendek — kalau lambat, langsung fallback ke Gemini
-const REQUEST_TIMEOUT = 6000;
+const USER_AGENT = 'NutriBot-Telegram/1.0 (https://github.com/nutribot)';
 
-// ─── BARCODE LOOKUP ───────────────────────────────────────────
+// ─── BARCODE LOOKUP (existing — tidak berubah) ────────────────
 
 /**
  * Cari produk berdasarkan barcode (EAN-13, EAN-8, UPC, dll)
- * Return null kalau tidak ditemukan atau data nutrisi tidak lengkap
  *
- * @param {string} barcode - kode barcode (contoh: "8996001303603")
- * @returns {object|null} data nutrisi produk atau null kalau tidak ketemu
+ * @param {string} barcode
+ * @returns {object|null}
  */
 async function lookupBarcode(barcode) {
     if (!barcode || typeof barcode !== 'string') return null;
 
-    // Bersihkan barcode — kadang hasil Gemini ada spasi atau karakter aneh
     const cleanBarcode = barcode.replace(/\D/g, '').trim();
     if (cleanBarcode.length < 8) {
         console.warn(`[OFF] Barcode terlalu pendek: "${cleanBarcode}"`);
@@ -37,27 +40,16 @@ async function lookupBarcode(barcode) {
         const response = await axios.get(`${OFF_BASE_URL}/product/${cleanBarcode}`, {
             params: {
                 fields: [
-                    'product_name',
-                    'product_name_id',   // nama dalam Bahasa Indonesia kalau ada
-                    'brands',
-                    'quantity',
-                    'serving_size',
-                    'nutriments',
-                    'image_front_url',
-                    'completeness',
-                    'status'
+                    'product_name', 'product_name_id', 'brands',
+                    'quantity', 'serving_size', 'nutriments',
+                    'image_front_url', 'completeness', 'status'
                 ].join(',')
             },
             timeout: REQUEST_TIMEOUT,
-            headers: {
-                // Identify ourselves sebagai NutriBot — good practice untuk Open Data
-                'User-Agent': 'NutriBot-Telegram/1.0 (contact via Telegram @NutriBot)'
-            }
+            headers: { 'User-Agent': USER_AGENT }
         });
 
         const data = response.data;
-
-        // OFF return status: 1 = found, 0 = not found
         if (data.status !== 1 || !data.product) {
             console.log(`[OFF] Produk tidak ditemukan: ${cleanBarcode}`);
             return null;
@@ -67,128 +59,174 @@ async function lookupBarcode(barcode) {
 
     } catch (err) {
         if (err.code === 'ECONNABORTED') {
-            console.warn('[OFF] Timeout, fallback ke Gemini');
+            console.warn('[OFF] Barcode lookup timeout');
         } else {
-            console.error('[OFF] Lookup error:', err.response?.status || err.message);
+            console.error('[OFF] Barcode lookup error:', err.response?.status || err.message);
         }
-        return null; // selalu fallback ke Gemini, jangan throw
+        return null;
+    }
+}
+
+// ─── NAME SEARCH (NEW) ────────────────────────────────────────
+
+/**
+ * Cari produk berdasarkan nama — untuk fallback chain di nutritionResolver
+ * Return produk pertama yang punya data nutrisi lengkap
+ *
+ * Strategi:
+ *   1. Search dengan nama English (lebih akurat di OFF)
+ *   2. Filter hasil yang ada data kalori
+ *   3. Prioritaskan produk dengan completeness tinggi
+ *   4. Ambil yang pertama (paling relevan menurut OFF)
+ *
+ * @param {string} foodName - nama makanan dalam bahasa Inggris (dari normalizeFood)
+ * @returns {object|null} product data dengan per_100g nutrition, atau null
+ */
+async function searchByName(foodName) {
+    if (!foodName || typeof foodName !== 'string') return null;
+
+    const cleanName = foodName.trim();
+    console.log(`[OFF] Search by name: "${cleanName}"`);
+
+    try {
+        const response = await axios.get(OFF_SEARCH_URL, {
+            params: {
+                search_terms:   cleanName,
+                search_simple:  1,
+                action:         'process',
+                json:           1,
+                page_size:      5,            // ambil 5, pilih yang terbaik
+                page:           1,
+                fields: [
+                    'product_name', 'brands',
+                    'serving_size', 'nutriments',
+                    'completeness', 'countries_tags'
+                ].join(','),
+            },
+            timeout: REQUEST_TIMEOUT,
+            headers: { 'User-Agent': USER_AGENT }
+        });
+
+        const products = response.data?.products;
+        if (!Array.isArray(products) || products.length === 0) {
+            console.log(`[OFF] Tidak ada hasil untuk: "${cleanName}"`);
+            return null;
+        }
+
+        // Filter: harus ada kalori yang valid
+        const withCalories = products.filter(p => {
+            const cal = p.nutriments?.['energy-kcal_100g'] ?? p.nutriments?.['energy-kcal'];
+            return cal && cal > 0;
+        });
+
+        if (withCalories.length === 0) {
+            console.log(`[OFF] Hasil ada tapi tidak ada data kalori: "${cleanName}"`);
+            return null;
+        }
+
+        // Sort: prioritaskan completeness tinggi
+        withCalories.sort((a, b) => (b.completeness || 0) - (a.completeness || 0));
+
+        const best = withCalories[0];
+        const parsed = parseProductData(best, cleanName);
+        if (!parsed) return null;
+
+        console.log(`[OFF] ✅ Name search hit: "${parsed.product_name}" (completeness: ${Math.round((best.completeness || 0) * 100)}%)`);
+        return parsed;
+
+    } catch (err) {
+        if (err.code === 'ECONNABORTED') {
+            console.warn('[OFF] Name search timeout');
+        } else {
+            console.error('[OFF] Name search error:', err.response?.status || err.message);
+        }
+        return null; // selalu return null, jangan throw — biar resolver lanjut ke layer berikutnya
     }
 }
 
 // ─── PARSE PRODUCT DATA ───────────────────────────────────────
 
-/**
- * Parse raw product data dari OFF → format standar NutriBot
- * Semua nilai nutrisi OFF adalah per 100g/100ml
- *
- * @param {object} product - raw product dari OFF API
- * @param {string} barcode - barcode untuk logging
- * @returns {object|null} data nutrisi terstandarisasi atau null kalau data gak lengkap
- */
-function parseProductData(product, barcode) {
+function parseProductData(product, identifier) {
     const n = product.nutriments || {};
 
-    // Kalori wajib ada — kalau gak ada, data gak berguna
     const caloriesPer100g = n['energy-kcal_100g'] ?? n['energy-kcal'] ?? null;
-    if (caloriesPer100g === null || caloriesPer100g === undefined) {
-        console.log(`[OFF] Data kalori tidak ada untuk barcode ${barcode}`);
+    if (caloriesPer100g === null) {
+        console.log(`[OFF] Data kalori tidak ada untuk: ${identifier}`);
         return null;
     }
 
-    // Ambil nama produk — prioritas: nama Indonesia > nama umum > brands
     const productName = (
         product.product_name_id ||
         product.product_name    ||
         product.brands          ||
-        'Produk tidak diketahui'
+        'Unknown Product'
     ).trim();
 
-    // Parse ukuran serving — OFF kadang pakai format "30g" atau "2 biscuits (30g)"
     const servingSize = parseServingSize(product.serving_size);
 
-    // Nutrisi per 100g dari OFF
-    const per100g = {
+    const per_100g = {
         calories:  Math.round(caloriesPer100g),
         protein_g: parseFloat((Number(n.proteins_100g)      || 0).toFixed(1)),
         carbs_g:   parseFloat((Number(n.carbohydrates_100g) || 0).toFixed(1)),
         fat_g:     parseFloat((Number(n.fat_100g)           || 0).toFixed(1)),
     };
 
-    // Hitung per serving kalau ada data serving size
-    let perServing = null;
+    let per_serving = null;
     if (servingSize?.grams > 0) {
         const ratio = servingSize.grams / 100;
-        perServing = {
-            calories:  Math.round(per100g.calories  * ratio),
-            protein_g: parseFloat((per100g.protein_g * ratio).toFixed(1)),
-            carbs_g:   parseFloat((per100g.carbs_g   * ratio).toFixed(1)),
-            fat_g:     parseFloat((per100g.fat_g     * ratio).toFixed(1)),
+        per_serving = {
+            calories:  Math.round(per_100g.calories  * ratio),
+            protein_g: parseFloat((per_100g.protein_g * ratio).toFixed(1)),
+            carbs_g:   parseFloat((per_100g.carbs_g   * ratio).toFixed(1)),
+            fat_g:     parseFloat((per_100g.fat_g     * ratio).toFixed(1)),
         };
     }
 
-    console.log(`[OFF] ✅ Ketemu: ${productName} | ${per100g.calories} kcal/100g`);
-
     return {
         found:          true,
-        barcode:        barcode,
         product_name:   productName,
         brand:          product.brands || null,
         quantity:       product.quantity || null,
         serving_size:   product.serving_size || null,
         serving_grams:  servingSize?.grams || null,
-        per_100g:       per100g,
-        per_serving:    perServing,
+        per_100g,
+        per_serving,
         image_url:      product.image_front_url || null,
         data_source:    'openfoodfacts',
-        completeness:   product.completeness || 0,  // 0-1, seberapa lengkap data produk
+        completeness:   product.completeness || 0,
     };
 }
 
 // ─── PARSE SERVING SIZE ───────────────────────────────────────
 
-/**
- * Parse string serving size ke angka gram
- * OFF punya berbagai format: "30g", "30 g", "1 biscuit (30g)", "250ml", dll
- *
- * @param {string|null} servingSizeStr
- * @returns {{ grams: number }|null}
- */
 function parseServingSize(servingSizeStr) {
     if (!servingSizeStr) return null;
-
     const str = servingSizeStr.toLowerCase().trim();
 
-    // Pattern: angka di dalam kurung + g/gram, contoh: "2 biscuits (30g)"
-    const parenMatch = str.match(/\((\d+(?:\.\d+)?)\s*g(?:ram)?s?\)/);
+    const parenMatch  = str.match(/\((\d+(?:\.\d+)?)\s*g(?:ram)?s?\)/);
     if (parenMatch) return { grams: parseFloat(parenMatch[1]) };
 
-    // Pattern: angka langsung diikuti g/gram, contoh: "30g" atau "30 gram"
     const directMatch = str.match(/^(\d+(?:\.\d+)?)\s*g(?:ram)?s?/);
     if (directMatch) return { grams: parseFloat(directMatch[1]) };
 
-    // Pattern: ml → asumsi 1ml = 1g (pendekatan untuk minuman)
-    const mlMatch = str.match(/^(\d+(?:\.\d+)?)\s*ml/);
+    const mlMatch     = str.match(/^(\d+(?:\.\d+)?)\s*ml/);
     if (mlMatch) return { grams: parseFloat(mlMatch[1]) };
 
-    return null; // format tidak dikenali
+    return null;
 }
 
-// ─── FORMAT RESULT → NUTRIBOT FORMAT ─────────────────────────
+// ─── FORMAT → NUTRIBOT FORMAT ─────────────────────────────────
 
 /**
- * Convert OFF result ke format NutriBot yang sama dengan output Gemini
- * Biar bisa langsung di-drop-in ke flow yang sudah ada
+ * Convert OFF result ke format standar NutriBot
+ * (untuk backward-compat dengan barcode flow yang sudah ada)
  *
- * Kalau ada serving size → pakai per serving
- * Kalau tidak ada → pakai per 100g (dengan note ke user)
- *
- * @param {object} offResult - hasil dari lookupBarcode()
- * @returns {object} format NutriBot (is_food, food_description, calories, dst)
+ * @param {object} offResult - hasil dari lookupBarcode() atau searchByName()
+ * @returns {object|null}
  */
 function toNutriFormat(offResult) {
     if (!offResult?.found) return null;
 
-    // Pilih basis perhitungan: per serving > per 100g
     const useServing = offResult.per_serving !== null;
     const nutrition  = useServing ? offResult.per_serving : offResult.per_100g;
     const basisNote  = useServing
@@ -200,16 +238,16 @@ function toNutriFormat(offResult) {
     return {
         is_food:          true,
         food_description: `${offResult.product_name}${brandPart}`,
-        food_items:       [],       // OFF sudah punya data lengkap, skip USDA lookup
+        food_items:       [],
         calories:         nutrition.calories,
         protein_g:        nutrition.protein_g,
         carbs_g:          nutrition.carbs_g,
         fat_g:            nutrition.fat_g,
-        confidence:       'high',   // data dari kemasan = akurat
+        confidence:       offResult.completeness > 0.6 ? 'high' : 'medium',
         notes:            `Data dari OpenFoodFacts, ${basisNote}`,
         gemini_raw:       null,
         data_source:      'openfoodfacts',
-        off_data:         offResult, // simpan raw OFF data kalau dibutuhkan
+        off_data:         offResult,
     };
 }
 
@@ -217,6 +255,7 @@ function toNutriFormat(offResult) {
 
 module.exports = {
     lookupBarcode,
+    searchByName,    // NEW
     toNutriFormat,
-    parseServingSize,   // export buat testing
+    parseServingSize,
 };

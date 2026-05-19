@@ -3,11 +3,12 @@
 // Update: tambah fitur saved menus (/menu, simpan, pilih, hapus)
 // ============================================================
 
-const db     = require('../services/database');
-const gemini = require('../services/gemini');
-const usda   = require('../services/usda');
-const calc   = require('../utils/calculator');
-const off    = require('../services/openfoodfacts');
+const db       = require('../services/database');
+const gemini   = require('../services/gemini');
+const usda     = require('../services/usda');
+const calc     = require('../utils/calculator');
+const off      = require('../services/openfoodfacts');
+const resolver = require('../services/nutritionResolver');
 
 const lastLogIdMap    = new Map();
 const lastResultMap   = new Map();
@@ -64,9 +65,30 @@ async function reply(ctx, text, extra = {}) {
  * Tampilkan ke user supaya tau data dari mana
  */
 function buildSourceBadge(result) {
+    const coverage = result.coverage ? ` (${result.coverage})` : '';
     switch (result.data_source) {
+        // ── Source baru dari resolver chain ──────────────────
+        case 'indonesian_dataset':
+            return `_✅ Data TKPI — database makanan Indonesia_ 🇮🇩`;
+        case 'indonesian_dataset_mixed':
+            return `_✅ Database makanan Indonesia${coverage}_ 🇮🇩`;
+        case 'cache':
+            return `_⚡ Cache nutrisi${coverage}_ ⚡`;
+        case 'cache_mixed':
+            return `_⚡ Cache + sumber lain${coverage}_ ⚡`;
+        case 'usda':
+            return `_✅ USDA FoodData Central${coverage}_ 🔬`;
+        case 'usda_mixed':
+            return `_✅ USDA FoodData${coverage}_ 🔬`;
         case 'openfoodfacts':
-            return `_✅ Data resmi kemasan via OpenFoodFacts_ 📦`;
+            return `_✅ Data resmi kemasan via OpenFoodFacts${coverage}_ 📦`;
+        case 'openfoodfacts_mixed':
+            return `_✅ OpenFoodFacts${coverage}_ 📦`;
+        case 'gemini_estimate':
+            return `_⚠️ Estimasi AI — data resmi tidak tersedia_ 🤖`;
+        case 'gemini_estimate_mixed':
+            return `_⚠️ Estimasi AI sebagian${coverage}_ 🤖`;
+        // ── Source lama (backward compat) ────────────────────
         case 'usda_primary':
             return `_✅ Kalori dari USDA FoodData (${result.usda_coverage})_ 🔬`;
         case 'usda_partial':
@@ -646,11 +668,11 @@ async function handleCatat(ctx) {
     );
 
     try {
-        // Estimasi nutrisi dari teks — tanpa foto!
-        const geminiResult = await gemini.estimateNutritionFromText(foodInput);
+        // 🔍 Resolver chain: cache → dataset lokal → USDA → OpenFoodFacts → Gemini
+        const result = await resolver.resolveFromText(foodInput);
 
         // Kalau Gemini bilang bukan makanan
-        if (!geminiResult.is_food) {
+        if (!result.is_food) {
             await ctx.telegram.editMessageText(
                 ctx.chat.id, loadingMsg.message_id, null,
                 `Hmm, gua gak ngerti itu makanan apa... 🤔\n\n` +
@@ -658,18 +680,6 @@ async function handleCatat(ctx) {
                 `Contoh: \`/catat nasi goreng 1 porsi\``
             );
             return;
-        }
-
-        // 🔍 USDA enrichment — lookup tiap food item ke USDA FoodData Central
-        let result = geminiResult;
-        try {
-            if (geminiResult.food_items?.length > 0) {
-                const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
-                result = usda.reconcileResults(geminiResult, usdaItems);
-            }
-        } catch (usdaErr) {
-            console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
-            // fallback ke gemini result aja, jangan throw
         }
 
         // Simpan ke food_logs — sama persis kayak dari foto
@@ -1426,29 +1436,15 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     try {
         const imageBuffer = await gemini.downloadImage(fileUrl);
 
-        // ─── Gemini Vision: identifikasi makanan + berat ───
-        let result = null;
-        {
-            const geminiResult = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
+        // 🔍 Resolver chain: Vision identify → cache → dataset → USDA → OFF → Gemini
+        const result = await resolver.resolveFromImage(imageBuffer, userContext);
 
-            if (!geminiResult.is_food) {
-                await ctx.telegram.editMessageText(
-                    ctx.chat.id, loadingMsg.message_id, null,
-                    `Hmm, kayaknya bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya! 📸`
-                );
-                return;
-            }
-
-            // 🔍 USDA enrichment — verifikasi kalori dengan data database nutrisi USDA
-            result = geminiResult;
-            try {
-                if (geminiResult.food_items?.length > 0) {
-                    const usdaItems = await usda.lookupMultipleFoods(geminiResult.food_items);
-                    result = usda.reconcileResults(geminiResult, usdaItems);
-                }
-            } catch (usdaErr) {
-                console.warn('[USDA] Enrichment gagal, fallback ke Gemini:', usdaErr.message);
-            }
+        if (!result.is_food) {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id, loadingMsg.message_id, null,
+                `Hmm, kayaknya bukan foto makanan deh... 🤔\nCoba kirim foto yang ada makanannya! 📸`
+            );
+            return;
         }
 
         // Simpan ke food_logs
