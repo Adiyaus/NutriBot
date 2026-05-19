@@ -230,17 +230,18 @@ Balas HANYA JSON (tidak ada teks lain):
     }
 }
 
-// ─── ESTIMASI SINGLE FOOD — LAST RESORT (NEW) ────────────────
+// ─── ESTIMASI SINGLE FOOD — LAST RESORT ──────────────────────
 
 /**
  * Estimasi nutrisi PER 100G untuk satu jenis makanan
  * Dipanggil HANYA kalau semua sumber lain (cache, dataset, USDA, OFF) gagal
  *
- * Prinsip konservatif:
- *   - Gunakan angka standar dari literatur gizi (TKPI / USDA average)
- *   - Bila ragu, ambil angka LEBIH RENDAH (underestimate > overestimate)
- *   - Jangan kreatif dengan perkiraan — stick to reference ranges
+ * Prinsip estimasi:
+ *   - Gunakan angka ATAS dari range referensi standar (TKPI / USDA)
+ *   - Bila ragu, pilih angka LEBIH TINGGI — sedikit overestimate lebih aman untuk tracking
+ *   - Untuk makanan berminyak/fast food, jangan remehkan kandungan lemak
  *   - Return per100g, bukan total portion (resolver yang scale)
+ *   - Bias tambahan diterapkan di nutritionResolver via geminiCalorieBias.js
  *
  * @param {string} foodName  - nama makanan (English/Indonesia)
  * @param {number} portionG  - besar porsi dalam gram (untuk konteks saja, output tetap per100g)
@@ -255,26 +256,30 @@ MAKANAN: "${foodName}"
 
 PRINSIP PENTING:
 1. Gunakan angka dari referensi standar: TKPI (Indonesia), USDA, atau tabel gizi resmi
-2. Bila ragu antara dua angka, pilih yang LEBIH RENDAH — underestimate lebih aman
-3. Jangan kreatif atau spekulatif — hanya gunakan range yang masuk akal untuk jenis makanan ini
-4. Kalau makanan tidak dikenal sama sekali, estimasi dari kategori terdekat
+2. Bila ragu antara dua angka, pilih yang LEBIH TINGGI — untuk calorie tracking, sedikit overestimate lebih aman
+3. Jangan meremehkan makanan berminyak, gorengan, fast food, atau makanan bersantan — kandungan lemaknya tinggi
+4. Untuk gorengan/fast food: hitung minyak yang terserap selama proses masak (rata-rata +30-50 kcal per 100g vs versi non-goreng)
+5. Kalau makanan tidak dikenal, estimasi dari kategori terdekat dengan angka atas range
 
-RANGE REFERENSI UMUM (per 100g):
-- Nasi/karbohidrat olahan: 130-200 kcal
-- Lauk goreng (ayam/ikan): 180-300 kcal
-- Lauk kukus/rebus: 100-180 kcal
-- Sayuran (tumis/rebus): 30-80 kcal
-- Gorengan/jajanan: 200-350 kcal
-- Buah-buahan: 40-100 kcal
-- Daging merah (matang): 150-250 kcal
+RANGE REFERENSI UMUM (per 100g) — GUNAKAN ANGKA ATAS:
+- Nasi/karbohidrat olahan: 150-200 kcal → pilih ~175-200
+- Lauk goreng (ayam/ikan): 230-320 kcal → pilih ~280-320
+- Lauk kukus/rebus: 120-180 kcal → pilih ~150-180
+- Sayuran tumis: 50-100 kcal → pilih ~80-100
+- Gorengan/jajanan berminyak: 280-400 kcal → pilih ~350-400
+- Fast food (burger, pizza): 250-350 kcal → pilih ~300-350
+- Buah-buahan: 50-100 kcal → pilih sesuai jenis
+- Daging merah matang: 180-280 kcal → pilih ~230-280
+- Makanan bersantan: 180-300 kcal → pilih ~250-300
+- Minuman manis (kopi susu, boba): 60-120 kcal per 100ml → pilih ~90-120
 
 Balas HANYA JSON ini, tidak ada teks lain:
 {
   "food_name": "nama standar makanan ini",
-  "calories_per100g": 130,
-  "protein_per100g": 2.7,
-  "carbs_per100g": 28.6,
-  "fat_per100g": 0.3,
+  "calories_per100g": 280,
+  "protein_per100g": 18.5,
+  "carbs_per100g": 5.2,
+  "fat_per100g": 21.0,
   "confidence": "low",
   "reference": "sumber referensi yang digunakan (contoh: TKPI 2017, USDA estimate)"
 }

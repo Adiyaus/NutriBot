@@ -20,6 +20,7 @@
 // ============================================================
 
 const { normalizeFood, buildSearchQueries } = require('../utils/normalizeFood');
+const { applyGeminiBias }                   = require('../utils/geminiCalorieBias');
 const cache  = require('./nutritionCache');
 const usda   = require('./usda');
 const off    = require('./openfoodfacts');
@@ -260,15 +261,19 @@ async function _tryGeminiEstimate(foodName, portionG, cacheKey) {
         const result = await gemini.estimateSingleFood(foodName, portionG);
         if (!result || result.calories_per100g <= 0) return null;
 
-        const per100g = {
+        // ── Terapkan calorie bias khusus Gemini ──────────────────
+        // USDA / dataset / OFF tidak kena bias ini — hanya Gemini estimate
+        const rawPer100g = {
             calories_per100g: result.calories_per100g,
             protein_per100g:  result.protein_per100g  || 0,
             carbs_per100g:    result.carbs_per100g    || 0,
             fat_per100g:      result.fat_per100g      || 0,
             food_name:        result.food_name || foodName,
             data_source:      'gemini_estimate',
-            confidence:       'low', // selalu low untuk Gemini estimate
+            confidence:       'low',
         };
+
+        const per100g = applyGeminiBias(rawPer100g, foodName);
 
         // Cache Gemini estimate dengan TTL lebih pendek (7 hari)
         // — kalau ada sumber lebih baik nanti, bisa di-refresh
