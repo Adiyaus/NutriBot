@@ -20,11 +20,26 @@
 // ============================================================
 
 const { normalizeFood, buildSearchQueries } = require('../utils/normalizeFood');
-const { findFood, toNutriFormat: datasetToNutri } = require('../data/indonesianFoods');
 const cache  = require('./nutritionCache');
 const usda   = require('./usda');
 const off    = require('./openfoodfacts');
 const gemini = require('./gemini');
+
+// Load dataset lokal secara defensive — jangan crash kalau file/folder belum ada
+let _findFood    = () => null;
+let _datasetToNutri = () => null;
+try {
+    const dataset = require('../data/indonesianFoods');
+    if (typeof dataset.findFood === 'function') {
+        _findFood       = dataset.findFood;
+        _datasetToNutri = dataset.toNutriFormat;
+        console.log('[Resolver] Indonesian food dataset loaded ✅');
+    } else {
+        console.warn('[Resolver] indonesianFoods.js ditemukan tapi findFood bukan function — skip dataset layer');
+    }
+} catch (err) {
+    console.warn('[Resolver] indonesianFoods.js tidak ditemukan — skip dataset layer:', err.message);
+}
 
 // ─── MAIN ENTRY POINTS ────────────────────────────────────────
 
@@ -149,9 +164,9 @@ async function _resolveOneItem(item) {
 
     // ── Layer 2: Local Indonesian Dataset ────────────────
     // Coba normalized Indonesia dulu, lalu English
-    const localEntry = findFood(normalized) || findFood(english);
+    const localEntry = _findFood(normalized) || _findFood(english);
     if (localEntry) {
-        const per100g = datasetToNutri(localEntry);
+        const per100g = _datasetToNutri(localEntry);
         // Simpan ke cache async — jangan blocking
         _cacheAsync(cacheKey, localEntry.display, per100g, 'indonesian_dataset', 'high');
         return _scaleToResult(item.name, portionG, per100g, 'indonesian_dataset');
