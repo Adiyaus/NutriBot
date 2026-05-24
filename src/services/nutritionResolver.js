@@ -45,7 +45,7 @@ const { applyPortionScaling,
 const { generateMacroRange,
         formatCompact }                   = require('../engine/calorieRangeGenerator');
 const { scoreConfidence,
-        buildDisclaimerMessage }          = require('../engine/confidenceScore');
+        buildDisclaimerMessage }          = require('../engine/confidenceScorer');
 
 // Load dataset lokal secara defensive
 let _findFood       = () => null;
