@@ -1,19 +1,31 @@
 // ============================================================
-// src/services/nutritionResolver.js
-// Orkestrasi fallback chain untuk lookup nutrisi
+// src/services/nutritionResolver.js — REVISED v2
+// Orkestrasi fallback chain + Realistic Estimation Pipeline
 //
-// FLOW (per food item):
+// PIPELINE BARU (per food item):
 //   1. normalizeFood()          → canonical name + cache key
 //   2. nutritionCache.get()     → Supabase cache (fastest)
-//   3. findFood() local dataset → ~70 makanan Indonesia (no network)
+//   3. findFood() local dataset → dataset Indonesia (no network)
 //   4. usda.searchFood()        → USDA FoodData Central API
 //   5. off.searchByName()       → OpenFoodFacts API
 //   6. gemini.estimateSingleFood() → Gemini AI (last resort)
 //
-// Semua hasil dari layer 2-5 di-cache untuk request berikutnya.
-// Gemini hasil di-cache dengan confidence 'low' — bisa di-refresh kalau ada sumber lebih baik.
+//   Setelah nilai base per100g diperoleh dari chain di atas:
+//   ↓ Layer: Cooking Adjustment  (cookingAdjustment.js)
+//   ↓ Layer: Portion Scaling     (portionScaling.js)
+//   ↓ Layer: Calorie Range Gen.  (calorieRangeGenerator.js)
+//   ↓ Layer: Confidence Scoring  (confidenceScorer.js)
 //
-// PUBLIC API:
+// PERUBAHAN DARI v1:
+//   + Cooking method detection + multiplier (tidak hanya Gemini estimate)
+//   + Portion scaling untuk kompensasi Gemini underestimate
+//   + Output berupa range (conservative / likely / upper)
+//   + Invisible calorie estimation (sambal, kecap, dll)
+//   + Confidence scoring yang lebih detail
+//   + Dataset bias correction (TKPI/USDA → nilai realistis)
+//   + Indonesian food floors (minimum kcal/100g)
+//
+// PUBLIC API (tidak berubah, backward compatible):
 //   resolveFromText(foodText)          → buat /catat
 //   resolveFromImage(imageBuffer, ctx) → buat foto
 //   resolveItems(foodItems)            → buat manual input array
@@ -21,13 +33,22 @@
 
 const { normalizeFood, buildSearchQueries } = require('../utils/normalizeFood');
 const { applyGeminiBias }                   = require('../utils/geminicaloriebias');
-const cache  = require('./nutritionCache');
-const usda   = require('./usda');
-const off    = require('./openfoodfacts');
-const gemini = require('./gemini');
+const cache   = require('./nutritionCache');
+const usda    = require('./usda');
+const off     = require('./openfoodfacts');
+const gemini  = require('./gemini');
 
-// Load dataset lokal secara defensive — jangan crash kalau file/folder belum ada
-let _findFood    = () => null;
+// ── New engine layers ─────────────────────────────────────────
+const { applyCookingAdjustment }          = require('../engine/cookingAdjustment');
+const { applyPortionScaling,
+        estimateInvisibleCalories }       = require('../engine/portionScaling');
+const { generateMacroRange,
+        formatCompact }                   = require('../engine/calorieRangeGenerator');
+const { scoreConfidence,
+        buildDisclaimerMessage }          = require('../engine/confidenceScorer');
+
+// Load dataset lokal secara defensive
+let _findFood       = () => null;
 let _datasetToNutri = () => null;
 try {
     const dataset = require('../data/indonesianFoods');
@@ -36,49 +57,39 @@ try {
         _datasetToNutri = dataset.toNutriFormat;
         console.log('[Resolver] Indonesian food dataset loaded ✅');
     } else {
-        console.warn('[Resolver] indonesianFoods.js ditemukan tapi findFood bukan function — skip dataset layer');
+        console.warn('[Resolver] indonesianFoods.js: findFood bukan function');
     }
 } catch (err) {
-    console.warn('[Resolver] indonesianFoods.js tidak ditemukan — skip dataset layer:', err.message);
+    console.warn('[Resolver] indonesianFoods.js tidak ditemukan:', err.message);
 }
+
 
 // ─── MAIN ENTRY POINTS ────────────────────────────────────────
 
 /**
  * Resolve nutrisi dari teks deskripsi makanan user (/catat)
- *
- * @param {string} foodText - contoh: "nasi goreng 1 piring, telur mata sapi 2 butir"
- * @returns {object} NutriBot result format
  */
 async function resolveFromText(foodText) {
     console.log(`[Resolver] resolveFromText: "${foodText}"`);
 
-    // Step 1: Gemini parse teks → food_items dengan portion_g
     let geminiParse;
     try {
         geminiParse = await gemini.estimateNutritionFromText(foodText);
     } catch (err) {
         console.error('[Resolver] Gemini parse gagal:', err.message);
-        throw err; // Kalau Gemini parse gagal total, kita memang gak bisa lanjut
+        throw err;
     }
 
     if (!geminiParse.is_food) return geminiParse;
-
-    // Step 2: Resolve nutrisi tiap item via fallback chain
-    return _resolveFromGeminiParse(geminiParse);
+    return _resolveFromGeminiParse(geminiParse, '', { sourceType: 'text' });
 }
 
 /**
  * Resolve nutrisi dari foto makanan
- *
- * @param {Buffer} imageBuffer
- * @param {string} [userContext] - konteks tambahan dari user
- * @returns {object} NutriBot result format
  */
 async function resolveFromImage(imageBuffer, userContext = '') {
     console.log(`[Resolver] resolveFromImage (context: "${userContext}")`);
 
-    // Step 1: Gemini Vision → identifikasi makanan + portion_g
     let geminiParse;
     try {
         geminiParse = await gemini.analyzeFoodImage(imageBuffer, 'image/jpeg', userContext);
@@ -88,17 +99,11 @@ async function resolveFromImage(imageBuffer, userContext = '') {
     }
 
     if (!geminiParse.is_food) return geminiParse;
-
-    // Step 2: Resolve nutrisi tiap item
-    return _resolveFromGeminiParse(geminiParse);
+    return _resolveFromGeminiParse(geminiParse, userContext, { sourceType: 'image' });
 }
 
 /**
- * Resolve dari array food_items yang sudah ada (e.g. dari saved menu)
- *
- * @param {Array<{name: string, portion_g: number}>} foodItems
- * @param {string} [description]
- * @returns {object} NutriBot result format
+ * Resolve dari array food_items yang sudah ada
  */
 async function resolveItems(foodItems, description = '') {
     if (!foodItems || foodItems.length === 0) {
@@ -106,27 +111,20 @@ async function resolveItems(foodItems, description = '') {
     }
 
     const resolvedItems = await Promise.all(
-        foodItems.map(item => _resolveOneItem(item))
+        foodItems.map(item => _resolveOneItem(item, '', 'text'))
     );
 
     return _aggregateResults(resolvedItems, description, foodItems);
 }
 
+
 // ─── INTERNAL: RESOLVE FROM GEMINI PARSE ─────────────────────
 
-/**
- * Setelah Gemini identify food_items, resolve nutrisi tiap item via chain
- * lalu aggregate hasilnya
- *
- * @private
- */
-async function _resolveFromGeminiParse(geminiParse) {
+async function _resolveFromGeminiParse(geminiParse, userContext = '', opts = {}) {
     const foodItems = geminiParse.food_items || [];
 
     if (foodItems.length === 0) {
-        // Gemini gak detect food_items → fallback ke nilai gemini langsung
-        // (ini edge case — biasanya kalau is_food: true pasti ada food_items)
-        console.warn('[Resolver] Gemini parse: is_food=true tapi food_items kosong');
+        console.warn('[Resolver] is_food=true tapi food_items kosong');
         return {
             ...geminiParse,
             data_source: 'gemini_only',
@@ -134,69 +132,143 @@ async function _resolveFromGeminiParse(geminiParse) {
         };
     }
 
+    const sourceType      = opts.sourceType || 'text';
+    const geminiConfidence = geminiParse.confidence || 'medium';
+    const mealDescription = geminiParse.food_description || '';
+
     const resolvedItems = await Promise.all(
-        foodItems.map(item => _resolveOneItem(item))
+        foodItems.map(item => _resolveOneItem(item, userContext, sourceType))
     );
 
-    return _aggregateResults(resolvedItems, geminiParse.food_description, foodItems, geminiParse);
+    return _aggregateResults(
+        resolvedItems,
+        mealDescription,
+        foodItems,
+        geminiParse,
+        { geminiConfidence, userContext, sourceType }
+    );
 }
 
-// ─── INTERNAL: RESOLVE ONE ITEM ──────────────────────────────
+
+// ─── INTERNAL: RESOLVE ONE ITEM (FULL PIPELINE) ──────────────
 
 /**
- * Jalankan fallback chain untuk satu food item
- * Return per-item nutrition yang sudah di-scale ke portion_g
+ * Step 1–5: Fallback chain → base per100g
+ * Step 6:   Cooking adjustment
+ * Step 7:   Portion scaling
+ * Step 8:   Scale adjusted values to actual portion
  *
- * @private
  * @param {{ name: string, portion_g: number }} item
- * @returns {{ name, portion_g, calories, protein_g, carbs_g, fat_g, source, resolved }}
+ * @param {string} userContext
+ * @param {string} sourceType - 'image' | 'text'
+ * @returns {ResolvedItem}
  */
-async function _resolveOneItem(item) {
-    const portionG = item.portion_g || 100;
+async function _resolveOneItem(item, userContext = '', sourceType = 'text') {
+    const rawPortionG = item.portion_g || 100;
     const { normalized, english, cacheKey } = normalizeFood(item.name);
 
     console.log(`[Resolver] Item: "${item.name}" → key="${cacheKey}", en="${english}"`);
 
-    // ── Layer 1: Supabase Cache ───────────────────────────
+    // ── STEP 1-5: Base Nutrition Chain ───────────────────────
+
+    let per100g = null;
+    let source  = 'failed';
+
+    // Layer 1: Cache
     const cached = await cache.get(cacheKey);
     if (cached) {
-        return _scaleToResult(item.name, portionG, cached, 'cache');
+        per100g = cached;
+        source  = 'cache';
     }
 
-    // ── Layer 2: Local Indonesian Dataset ────────────────
-    // Coba normalized Indonesia dulu, lalu English
-    const localEntry = _findFood(normalized) || _findFood(english);
-    if (localEntry) {
-        const per100g = _datasetToNutri(localEntry);
-        // Simpan ke cache async — jangan blocking
-        _cacheAsync(cacheKey, localEntry.display, per100g, 'indonesian_dataset', 'high');
-        return _scaleToResult(item.name, portionG, per100g, 'indonesian_dataset');
+    // Layer 2: Local Indonesian Dataset
+    if (!per100g) {
+        const localEntry = _findFood(normalized) || _findFood(english);
+        if (localEntry) {
+            per100g = _datasetToNutri(localEntry);
+            source  = 'indonesian_dataset';
+            _cacheAsync(cacheKey, localEntry.display, per100g, 'indonesian_dataset', 'high');
+        }
     }
 
-    // ── Layer 3: USDA API ─────────────────────────────────
-    const queries = buildSearchQueries(normalized, english);
-    const usdaPer100g = await _tryUSDA(queries, cacheKey);
-    if (usdaPer100g) {
-        return _scaleToResult(item.name, portionG, usdaPer100g, 'usda');
+    // Layer 3: USDA
+    if (!per100g) {
+        const queries   = buildSearchQueries(normalized, english);
+        const usdaResult = await _tryUSDA(queries, cacheKey);
+        if (usdaResult) {
+            per100g = usdaResult;
+            source  = 'usda';
+        }
     }
 
-    // ── Layer 4: OpenFoodFacts API ────────────────────────
-    const offPer100g = await _tryOpenFoodFacts(english, cacheKey);
-    if (offPer100g) {
-        return _scaleToResult(item.name, portionG, offPer100g, 'openfoodfacts');
+    // Layer 4: OpenFoodFacts
+    if (!per100g) {
+        const offResult = await _tryOpenFoodFacts(english, cacheKey);
+        if (offResult) {
+            per100g = offResult;
+            source  = 'openfoodfacts';
+        }
     }
 
-    // ── Layer 5: Gemini Estimation (last resort) ──────────
-    console.warn(`[Resolver] Semua sumber gagal untuk "${item.name}" — fallback ke Gemini`);
-    const geminiPer100g = await _tryGeminiEstimate(item.name, portionG, cacheKey);
-    if (geminiPer100g) {
-        return _scaleToResult(item.name, portionG, geminiPer100g, 'gemini_estimate');
+    // Layer 5: Gemini Estimate (last resort)
+    if (!per100g) {
+        console.warn(`[Resolver] Fallback Gemini estimate: "${item.name}"`);
+        const geminiResult = await _tryGeminiEstimate(item.name, rawPortionG, cacheKey);
+        if (geminiResult) {
+            per100g = geminiResult;
+            source  = 'gemini_estimate';
+        }
     }
 
-    // ── Complete Failure ──────────────────────────────────
-    console.error(`[Resolver] Total gagal untuk item: "${item.name}"`);
-    return _failedItem(item.name, portionG);
+    // Complete failure
+    if (!per100g) {
+        console.error(`[Resolver] Total gagal: "${item.name}"`);
+        return _failedItem(item.name, rawPortionG);
+    }
+
+    // ── STEP 6: Cooking Adjustment ───────────────────────────
+    // Detect metode masak dari nama, terapkan multiplier realistis
+
+    const adjustedPer100g = applyCookingAdjustment(
+        per100g,
+        item.name,
+        source,
+        'mid'   // variant mid = most likely
+    );
+
+    // ── STEP 7: Portion Scaling ──────────────────────────────
+    // Kompensasi Gemini underestimate untuk warung/restoran
+
+    // Cek apakah user memberikan berat eksplisit (dari notes Gemini atau angka langsung)
+    const hasExplicitPortion = _hasExplicitPortion(item);
+
+    const portionResult = applyPortionScaling(
+        rawPortionG,
+        item.name,
+        userContext,
+        'mid',
+        hasExplicitPortion
+    );
+    const finalPortionG = portionResult.adjusted_portion_g;
+
+    // ── STEP 8: Scale to Actual Portion ──────────────────────
+
+    const scaledResult = _scaleToResult(
+        item.name,
+        finalPortionG,
+        adjustedPer100g,
+        source,
+        {
+            original_portion_g:  rawPortionG,
+            portion_context:     portionResult.context,
+            portion_scale:       portionResult.scale_factor,
+            cooking_adjustment:  adjustedPer100g.cooking_adjustment,
+        }
+    );
+
+    return scaledResult;
 }
+
 
 // ─── INTERNAL: LAYER IMPLEMENTATIONS ─────────────────────────
 
@@ -204,7 +276,7 @@ async function _tryUSDA(queries, cacheKey) {
     for (const query of queries) {
         try {
             const results = await usda.searchFood(query, 1);
-            if (results.length === 0) continue;
+            if (!results.length) continue;
 
             const best = results[0];
             if (!best.calories_per100g || best.calories_per100g <= 0) continue;
@@ -224,8 +296,7 @@ async function _tryUSDA(queries, cacheKey) {
             return per100g;
 
         } catch (err) {
-            console.warn(`[Resolver] USDA error untuk "${query}":`, err.message);
-            // Lanjut ke query berikutnya atau layer berikutnya
+            console.warn(`[Resolver] USDA error "${query}":`, err.message);
         }
     }
     return null;
@@ -261,8 +332,6 @@ async function _tryGeminiEstimate(foodName, portionG, cacheKey) {
         const result = await gemini.estimateSingleFood(foodName, portionG);
         if (!result || result.calories_per100g <= 0) return null;
 
-        // ── Terapkan calorie bias khusus Gemini ──────────────────
-        // USDA / dataset / OFF tidak kena bias ini — hanya Gemini estimate
         const rawPer100g = {
             calories_per100g: result.calories_per100g,
             protein_per100g:  result.protein_per100g  || 0,
@@ -273,12 +342,11 @@ async function _tryGeminiEstimate(foodName, portionG, cacheKey) {
             confidence:       'low',
         };
 
-        const per100g = applyGeminiBias(rawPer100g, foodName);
+        // Apply geminicaloriebias (tetap ada untuk gemini_estimate)
+        const biasedPer100g = applyGeminiBias(rawPer100g, foodName);
 
-        // Cache Gemini estimate dengan TTL lebih pendek (7 hari)
-        // — kalau ada sumber lebih baik nanti, bisa di-refresh
-        _cacheAsync(cacheKey, per100g.food_name, per100g, 'gemini_estimate', 'low');
-        return per100g;
+        _cacheAsync(cacheKey, biasedPer100g.food_name, biasedPer100g, 'gemini_estimate', 'low');
+        return biasedPer100g;
 
     } catch (err) {
         console.error('[Resolver] Gemini estimate error:', err.message);
@@ -286,24 +354,29 @@ async function _tryGeminiEstimate(foodName, portionG, cacheKey) {
     }
 }
 
+
 // ─── INTERNAL: SCALE & AGGREGATE ─────────────────────────────
 
-/**
- * Scale per100g nutrition ke actual portion_g
- * @private
- */
-function _scaleToResult(name, portionG, per100g, source) {
+function _scaleToResult(name, portionG, per100g, source, meta = {}) {
     const scale = portionG / 100;
     return {
         name,
-        portion_g:  portionG,
-        calories:   Math.round((per100g.calories_per100g || 0) * scale),
-        protein_g:  parseFloat(((per100g.protein_per100g || 0) * scale).toFixed(1)),
-        carbs_g:    parseFloat(((per100g.carbs_per100g   || 0) * scale).toFixed(1)),
-        fat_g:      parseFloat(((per100g.fat_per100g     || 0) * scale).toFixed(1)),
+        portion_g:           portionG,
+        original_portion_g:  meta.original_portion_g || portionG,
+        calories:            Math.round((per100g.calories_per100g || 0) * scale),
+        protein_g:           parseFloat(((per100g.protein_per100g || 0) * scale).toFixed(1)),
+        carbs_g:             parseFloat(((per100g.carbs_per100g   || 0) * scale).toFixed(1)),
+        fat_g:               parseFloat(((per100g.fat_per100g     || 0) * scale).toFixed(1)),
         source,
-        food_name:  per100g.food_name || name,
-        resolved:   true,
+        food_name:           per100g.food_name || name,
+        resolved:            true,
+        // Metadata pipeline (untuk debug / detail view)
+        _meta: {
+            calories_per100g:   per100g.calories_per100g,
+            portion_context:    meta.portion_context,
+            portion_scale:      meta.portion_scale,
+            cooking_adjustment: meta.cooking_adjustment,
+        },
     };
 }
 
@@ -321,10 +394,11 @@ function _failedItem(name, portionG) {
 }
 
 /**
- * Aggregate semua resolved items → satu result object
- * @private
+ * Aggregate semua resolved items → satu result object dengan range
  */
-function _aggregateResults(resolvedItems, description, originalItems, geminiParse = null) {
+function _aggregateResults(resolvedItems, description, originalItems, geminiParse = null, opts = {}) {
+
+    // ── Hitung totals (mid estimate) ──────────────────────────
     const total = resolvedItems.reduce((acc, item) => ({
         calories:  acc.calories  + (item.calories  || 0),
         protein_g: acc.protein_g + (item.protein_g || 0),
@@ -332,69 +406,154 @@ function _aggregateResults(resolvedItems, description, originalItems, geminiPars
         fat_g:     acc.fat_g     + (item.fat_g     || 0),
     }), { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
 
-    // Hitung coverage dan sumber data dominan
+    // ── Source analysis ───────────────────────────────────────
     const resolvedCount = resolvedItems.filter(i => i.resolved).length;
     const totalCount    = resolvedItems.length;
 
-    // Tentukan data_source berdasarkan sumber yang paling banyak dipakai
     const sourceCounts = {};
     for (const item of resolvedItems) {
         if (item.resolved) {
             sourceCounts[item.source] = (sourceCounts[item.source] || 0) + 1;
         }
     }
+
     const dominantSource = Object.entries(sourceCounts)
-        .sort((a, b) => b[1] - a[1])[0]?.[0] || 'failed';
+        .sort((a, b) => b[1] - a[1])[0]?.[0] || 'gemini_estimate';
 
-    // Confidence: kalau ada gemini_estimate di chain, turunkan confidence
-    const hasGeminiEstimate = resolvedItems.some(i => i.source === 'gemini_estimate');
-    const hasFailed         = resolvedItems.some(i => !i.resolved);
-    const confidence = hasFailed
-        ? 'low'
-        : hasGeminiEstimate
-            ? 'low'
-            : resolvedCount === totalCount ? 'high' : 'medium';
+    // ── Dominant cooking method ───────────────────────────────
+    const cookingMethods = resolvedItems
+        .filter(i => i.resolved && i._meta?.cooking_adjustment?.method)
+        .map(i => i._meta.cooking_adjustment.method);
 
-    // Bangun human-readable resolver summary
+    const dominantMethod = _mostCommon(cookingMethods) || 'pan_fried';
+
+    // ── Invisible calories ────────────────────────────────────
+    const mealDesc = description || resolvedItems.map(i => i.name).join(' ');
+    const invisible = estimateInvisibleCalories('', mealDesc);
+    const invisibleKcal = invisible.extra_kcal;
+
+    const adjustedTotal = {
+        ...total,
+        calories: Math.round(total.calories + invisibleKcal),
+    };
+
+    // ── Calorie Range ─────────────────────────────────────────
+    const baseConfidence = _calcBaseConfidence(resolvedItems, opts.geminiConfidence);
+
+    const macroRange = generateMacroRange(
+        adjustedTotal,
+        dominantSource,
+        dominantMethod,
+        baseConfidence
+    );
+
+    // ── Confidence Scoring ────────────────────────────────────
+    const cookingDetection = resolvedItems[0]?._meta?.cooking_adjustment
+        ? { confidence: resolvedItems[0]._meta.cooking_adjustment.method_confidence || 'medium' }
+        : null;
+
+    const confidenceResult = scoreConfidence({
+        resolvedItems,
+        dominantSource,
+        geminiConfidence:      opts.geminiConfidence || 'medium',
+        cookingDetection,
+        portionDetection:      null,
+        hasInvisibleCalories:  invisibleKcal > 0,
+        userExplicitPortion:   false,
+    });
+
+    const disclaimer = buildDisclaimerMessage(confidenceResult);
+
+    // ── Build resolver summary ────────────────────────────────
     const resolverSummary = resolvedItems
         .map(i => `${i.name}(${i.source})`)
         .join(', ');
 
     return {
-        is_food:          true,
-        food_description: description || resolvedItems.map(i => i.name).join(', '),
-        food_items:       originalItems,
-        calories:         Math.round(total.calories),
-        protein_g:        parseFloat(total.protein_g.toFixed(1)),
-        carbs_g:          parseFloat(total.carbs_g.toFixed(1)),
-        fat_g:            parseFloat(total.fat_g.toFixed(1)),
-        confidence,
-        data_source:      _buildDataSource(sourceCounts, resolvedCount, totalCount),
-        resolver_items:   resolvedItems,
-        resolver_summary: resolverSummary,
-        coverage:         `${resolvedCount}/${totalCount}`,
-        // Teruskan gemini_raw kalau ada — untuk debug / disimpan di DB
-        gemini_raw:       geminiParse?.gemini_raw || null,
-        notes:            geminiParse?.notes || '',
+        is_food:           true,
+        food_description:  description || resolvedItems.map(i => i.name).join(', '),
+        food_items:        originalItems,
+
+        // ── Point estimates (most likely, untuk backward compat) ──
+        calories:          macroRange.calories.likely,
+        protein_g:         parseFloat(total.protein_g.toFixed(1)),
+        carbs_g:           parseFloat(total.carbs_g.toFixed(1)),
+        fat_g:             parseFloat(total.fat_g.toFixed(1)),
+
+        // ── NEW: Calorie ranges ───────────────────────────────────
+        calorie_range: {
+            conservative: macroRange.calories.conservative,
+            likely:       macroRange.calories.likely,
+            upper:        macroRange.calories.upper,
+            display:      macroRange.calories.display_text,
+            uncertainty_pct: macroRange.calories.uncertainty_pct,
+        },
+
+        macro_range: {
+            protein:  macroRange.protein_g,
+            carbs:    macroRange.carbs_g,
+            fat:      macroRange.fat_g,
+        },
+
+        // ── NEW: Cooking & portion metadata ──────────────────────
+        cooking_method:    dominantMethod,
+        invisible_calories: {
+            amount:     invisibleKcal,
+            components: invisible.components,
+        },
+
+        // ── NEW: Confidence detail ────────────────────────────────
+        confidence:          confidenceResult.level,
+        confidence_score:    confidenceResult.score,
+        confidence_badge:    confidenceResult.display_badge,
+        confidence_reasons:  confidenceResult.reasons,
+        disclaimer,
+
+        // ── Existing fields (unchanged) ───────────────────────────
+        data_source:       _buildDataSource(sourceCounts, resolvedCount, totalCount),
+        resolver_items:    resolvedItems,
+        resolver_summary:  resolverSummary,
+        coverage:          `${resolvedCount}/${totalCount}`,
+        gemini_raw:        geminiParse?.gemini_raw || null,
+        notes:             geminiParse?.notes || '',
     };
 }
 
-/**
- * Bangun data_source label yang informatif untuk badge di Telegram
- * @private
- */
+
+// ─── HELPERS ──────────────────────────────────────────────────
+
+function _hasExplicitPortion(item) {
+    // Kalau item punya notes tentang berat eksplisit dari user
+    // (Gemini menyebut "user mentioned 300g" atau serupa)
+    if (!item.notes) return false;
+    return /\d+\s*(gram|g\b|kg)/.test(item.notes);
+}
+
+function _calcBaseConfidence(resolvedItems, geminiConfidence) {
+    const hasGemini = resolvedItems.some(i => i.source === 'gemini_estimate');
+    const hasFailed = resolvedItems.some(i => !i.resolved);
+
+    if (hasFailed)        return 'low';
+    if (hasGemini)        return 'low';
+    if (geminiConfidence === 'low') return 'medium';
+    return 'high';
+}
+
+function _mostCommon(arr) {
+    if (!arr.length) return null;
+    const counts = {};
+    for (const v of arr) { counts[v] = (counts[v] || 0) + 1; }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+}
+
 function _buildDataSource(sourceCounts, resolvedCount, totalCount) {
     const sources = Object.keys(sourceCounts);
-
     if (sources.length === 0) return 'failed';
     if (sources.length === 1) return sources[0];
 
-    // Multiple sources — urutkan berdasarkan prioritas kualitas
     const priority = ['indonesian_dataset', 'usda', 'openfoodfacts', 'cache', 'gemini_estimate'];
     const sorted   = sources.sort((a, b) => priority.indexOf(a) - priority.indexOf(b));
-
-    if (sorted[0] === 'cache') return 'cache_mixed';
-    return `${sorted[0]}_mixed`;
+    return sorted[0] === 'cache' ? 'cache_mixed' : `${sorted[0]}_mixed`;
 }
 
 function _emptyResult(description) {
@@ -406,16 +565,11 @@ function _emptyResult(description) {
     };
 }
 
-// ─── INTERNAL: ASYNC CACHE HELPER ────────────────────────────
-
-/**
- * Simpan ke cache tanpa blocking — error diabaikan
- * @private
- */
 function _cacheAsync(cacheKey, foodName, per100g, dataSource, confidence) {
     cache.set(cacheKey, foodName, per100g, dataSource, confidence)
         .catch(err => console.error('[Resolver] cache async error:', err.message));
 }
+
 
 // ─── EXPORTS ──────────────────────────────────────────────────
 
