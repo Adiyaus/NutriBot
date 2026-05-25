@@ -102,6 +102,54 @@ function buildSourceBadge(result) {
     }
 }
 
+// ─── HELPER: PROGRESS BAR + RESULT MESSAGE ───────────────────
+
+/**
+ * Build blok progress bar kalori harian untuk disisipkan ke dalam pesan result
+ *
+ * @param {object} summary     - daily summary dari DB (SUDAH include log terbaru)
+ * @param {object} user        - user object (untuk daily_calorie_goal)
+ * @returns {{ bar, text }}
+ */
+function buildProgressSection(summary, user) {
+    const consumed  = Math.round(summary.total_calories || 0);
+    const goal      = Math.round(user.daily_calorie_goal || 2000);
+    const bar       = buildProgressBar(consumed, goal);
+
+    const remainingLine = bar.isOver
+        ? `⚠️ *Over ${bar.over} kkal* dari target hari ini!`
+        : `Sisa: *${bar.remaining} kkal* buat hari ini`;
+
+    const text =
+        `━━━━━━━━━━━━━━
+` +
+        `📊 *Progress Hari Ini (${goal} kkal target):*
+` +
+        `${bar.emoji} ${bar.text}
+` +
+        `${remainingLine}`;
+
+    return { bar, text };
+}
+
+/**
+ * Fire-and-forget coach insight setelah main result terkirim.
+ * Dipanggil tanpa await — kalau gagal, silent saja.
+ *
+ * @param {object} ctx
+ * @param {object} user
+ * @param {object} result      - nutrition result object
+ * @param {object} summary     - daily summary (AFTER insert)
+ */
+function fireInsight(ctx, user, result, summary) {
+    const bar = buildProgressBar(
+        Math.round(summary.total_calories || 0),
+        Math.round(user.daily_calorie_goal || 2000)
+    );
+    generateAndSendInsight(ctx, { user, mealResult: result, summary, bar })
+        .catch(err => console.warn('[fireInsight] silent error:', err.message));
+}
+
 // ─── COMMAND HANDLERS ────────────────────────────────────────
 
 async function handleStart(ctx) {
@@ -696,14 +744,10 @@ async function handleCatat(ctx) {
         lastLogIdMap.set(tgId, savedLog.id);
         lastResultMap.set(tgId, result);
 
-        // Hitung sisa kalori
-        const summary   = await db.getDailySummary(tgId);
-        const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
-
-        const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-        const remainingText = remaining > 0
-            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+        // Hitung sisa kalori + progress bar
+        const summary               = await db.getDailySummary(tgId);
+        const { bar, text: progTxt} = buildProgressSection(summary, user);
+        const statusEmoji           = bar.isOver ? '🚨' : '✅';
 
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
@@ -716,9 +760,7 @@ async function handleCatat(ctx) {
             `${result.notes ? `\n📌 _Asumsi: ${result.notes}_\n` : ''}` +
             `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah — coba tulis lebih detail_\n' : ''}` +
             `\n${buildSourceBadge(result)}\n\n` +
-            `━━━━━━━━━━━━━━\n` +
-            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-            `${remainingText}`,
+            progTxt,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
@@ -729,6 +771,9 @@ async function handleCatat(ctx) {
                 }
             }
         );
+
+        // Fire insight (non-blocking — gak nunggu, gak crash kalau gagal)
+        fireInsight(ctx, user, result, summary);
 
     } catch (err) {
         console.error(`[CatatHandler] Error for ${tgId}:`, err.message);
@@ -1461,28 +1506,21 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
         lastLogIdMap.set(tgId, savedLog.id);
         lastResultMap.set(tgId, result); // simpan full result buat fitur save menu
 
-        const summary   = await db.getDailySummary(tgId);
-        const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
-
-        const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-        const remainingText = remaining > 0
-            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+        const summary                = await db.getDailySummary(tgId);
+        const { bar, text: progTxt } = buildProgressSection(summary, user);
+        const statusEmoji            = bar.isOver ? '🚨' : '✅';
 
         await ctx.telegram.editMessageText(
             ctx.chat.id, loadingMsg.message_id, null,
             `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
             `🍽️ *${result.food_description}*\n` +
-
             `\n🔥 Kalori: *${result.calories} kkal*\n` +
             `💪 Protein: *${result.protein_g}g*\n` +
             `🍚 Karbo: *${result.carbs_g}g*\n` +
             `🥑 Lemak: *${result.fat_g}g*\n` +
             `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah, coba foto lebih jelas_\n' : ''}` +
             `\n${buildSourceBadge(result)}\n\n` +
-            `━━━━━━━━━━━━━━\n` +
-            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-            `${remainingText}`,
+            progTxt,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
@@ -1494,6 +1532,9 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
                 }
             }
         );
+        // Fire insight (non-blocking)
+        fireInsight(ctx, user, result, summary);
+
 
     } catch (err) {
         console.error(`[PhotoHandler] Error for ${tgId}:`, err.message);
@@ -1606,13 +1647,10 @@ async function handleInputTemplate(ctx, tgId, text, user) {
         lastLogIdMap.set(tgId, savedLog.id);
         lastResultMap.set(tgId, { food_description: name, calories, protein_g, carbs_g, fat_g });
 
-        const summary   = await db.getDailySummary(tgId);
-        const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
-
-        const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-        const remainingText = remaining > 0
-            ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-            : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+        const summary                = await db.getDailySummary(tgId);
+        const { bar, text: progTxt } = buildProgressSection(summary, user);
+        const statusEmoji            = bar.isOver ? '🚨' : '✅';
+        const fakeResult             = { food_description: name, calories, protein_g, carbs_g, fat_g };
 
         await reply(ctx,
             `${statusEmoji} *Makanan Tercatat!*\n\n` +
@@ -1622,9 +1660,7 @@ async function handleInputTemplate(ctx, tgId, text, user) {
             `🍚 Karbo: *${carbs_g}g*\n` +
             `🥑 Lemak: *${fat_g}g*\n\n` +
             `_Input manual_ ✍️\n\n` +
-            `━━━━━━━━━━━━━━\n` +
-            `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-            `${remainingText}`,
+            progTxt,
             {
                 reply_markup: {
                     inline_keyboard: [[
@@ -1634,6 +1670,9 @@ async function handleInputTemplate(ctx, tgId, text, user) {
                 }
             }
         );
+        // Fire insight (non-blocking)
+        fireInsight(ctx, user, fakeResult, summary);
+
     } catch (err) {
         console.error(`[InputTemplate] Error for ${tgId}:`, err.message);
         await reply(ctx, `😵 Gagal nyimpen. Coba lagi ya!`);
@@ -1740,13 +1779,9 @@ async function handleInputStep(ctx, tgId, body) {
                 lastResultMap.set(tgId, finalData);
 
                 // Hitung progress hari ini
-                const summary   = await db.getDailySummary(tgId);
-                const remaining = user.daily_calorie_goal - (summary.total_calories || 0);
-
-                const statusEmoji   = remaining > 0 ? '✅' : '🚨';
-                const remainingText = remaining > 0
-                    ? `Sisa: *${Math.round(remaining)} kkal* buat hari ini`
-                    : `⚠️ Over *${Math.abs(Math.round(remaining))} kkal* dari target!`;
+                const summary                = await db.getDailySummary(tgId);
+                const { bar, text: progTxt } = buildProgressSection(summary, user);
+                const statusEmoji            = bar.isOver ? '🚨' : '✅';
 
                 await reply(ctx,
                     `${statusEmoji} *Makanan Tercatat!*\n\n` +
@@ -1756,9 +1791,7 @@ async function handleInputStep(ctx, tgId, body) {
                     `🍚 Karbo: *${finalData.carbs_g}g*\n` +
                     `🥑 Lemak: *${finalData.fat_g}g*\n\n` +
                     `_Input manual — data dari lo sendiri_ ✍️\n\n` +
-                    `━━━━━━━━━━━━━━\n` +
-                    `📊 *Progress Hari Ini (${Math.round(user.daily_calorie_goal)} kkal target):*\n` +
-                    `${remainingText}`,
+                    progTxt,
                     {
                         reply_markup: {
                             inline_keyboard: [[
@@ -1768,6 +1801,9 @@ async function handleInputStep(ctx, tgId, body) {
                         }
                     }
                 );
+
+                // Fire insight (non-blocking)
+                fireInsight(ctx, user, finalData, summary);
 
             } catch (err) {
                 console.error(`[InputHandler] DB error for ${tgId}:`, err.message);
