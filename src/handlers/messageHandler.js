@@ -17,6 +17,10 @@ const editModeMap     = new Map();
 const saveMenuModeMap = new Map();
 const inputModeMap    = new Map();
 const photoContextMap = new Map();
+
+// ── New micro-features ────────────────────────────────────────
+const { buildProgressBar: buildProgressBarUtil } = require('../utils/progressBar');
+const { generateAndSendInsight }                 = require('../services/coachInsight');
 const coachHistoryMap = new Map(); // simpan history percakapan /tanya per user
 // coachHistoryMap value: Array of { role: 'user'|'assistant', content: string }
 // Max 10 pesan terakhir biar gak kebanyakan token
@@ -114,7 +118,7 @@ function buildSourceBadge(result) {
 function buildProgressSection(summary, user) {
     const consumed  = Math.round(summary.total_calories || 0);
     const goal      = Math.round(user.daily_calorie_goal || 2000);
-    const bar       = buildProgressBar(consumed, goal);
+    const bar       = buildProgressBarUtil(consumed, goal);
 
     const remainingLine = bar.isOver
         ? `⚠️ *Over ${bar.over} kkal* dari target hari ini!`
@@ -142,7 +146,7 @@ function buildProgressSection(summary, user) {
  * @param {object} summary     - daily summary (AFTER insert)
  */
 function fireInsight(ctx, user, result, summary) {
-    const bar = buildProgressBar(
+    const bar = buildProgressBarUtil(
         Math.round(summary.total_calories || 0),
         Math.round(user.daily_calorie_goal || 2000)
     );
