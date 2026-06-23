@@ -137,6 +137,28 @@ function buildProgressSection(summary, user) {
 }
 
 /**
+ * Build blok kisaran kalori + disclaimer confidence buat hasil dari resolver chain
+ * (foto & /catat). Manual input (/input) gak punya field ini — sengaja kosong
+ * karena angkanya emang dari user sendiri, gak perlu range/uncertainty.
+ *
+ * @param {object} result - hasil dari nutritionResolver
+ * @returns {string} - blok teks siap disisipin ke pesan (kosong kalau gak ada data range)
+ */
+function buildRangeAndDisclaimer(result) {
+    if (!result.calorie_range) return '';
+
+    let block = `\n📊 _Estimasi: ${result.calorie_range.display}_`;
+
+    // Disclaimer cuma muncul kalau confidence bukan 'high'
+    // (sudah termasuk badge + alasan ketidakpastian, format siap pakai)
+    if (result.disclaimer) {
+        block += `\n\n${result.disclaimer}`;
+    }
+
+    return block;
+}
+
+/**
  * Fire-and-forget coach insight setelah main result terkirim.
  * Dipanggil tanpa await — kalau gagal, silent saja.
  *
@@ -286,38 +308,6 @@ async function handleProfil(ctx) {
             reply_markup: {
                 inline_keyboard: [[
                     { text: '✏️ Update Profil', callback_data: 'update_profile' }
-                ]]
-            }
-        }
-    );
-}
-
-async function handleReset(ctx) {
-    const tgId = ctx.from.id;
-    const user = await db.getUser(tgId);
-
-    if (!user?.is_registered) {
-        await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
-        return;
-    }
-
-    const summary = await db.getDailySummary(tgId);
-
-    if (!summary.meal_count || summary.meal_count === 0) {
-        await reply(ctx, `📭 Belum ada log makanan hari ini!`);
-        return;
-    }
-
-    await reply(ctx,
-        `⚠️ *Yakin mau reset log hari ini?*\n\n` +
-        `• ${summary.meal_count}x log makanan\n` +
-        `• Total ${Math.round(summary.total_calories)} kkal\n\n` +
-        `_Aksi ini gak bisa di-undo!_`,
-        {
-            reply_markup: {
-                inline_keyboard: [[
-                    { text: '✅ Ya, Reset!', callback_data: 'confirm_reset' },
-                    { text: '❌ Batalin',    callback_data: 'cancel_reset'  }
                 ]]
             }
         }
@@ -762,8 +752,8 @@ async function handleCatat(ctx) {
             `🍚 Karbo: *${result.carbs_g}g*\n` +
             `🥑 Lemak: *${result.fat_g}g*\n` +
             `${result.notes ? `\n📌 _Asumsi: ${result.notes}_\n` : ''}` +
-            `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah — coba tulis lebih detail_\n' : ''}` +
-            `\n${buildSourceBadge(result)}\n\n` +
+            buildRangeAndDisclaimer(result) +
+            `\n\n${buildSourceBadge(result)}\n\n` +
             progTxt,
             {
                 parse_mode: 'Markdown',
@@ -1166,6 +1156,13 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
+    // ── Tombol "✏️ Koreksi" yang muncul otomatis setelah log makanan ──
+    // (foto, /catat, /input) — reuse logic yang sama kayak command /adjust
+    if (data === 'adjust_last') {
+        await handleAdjust(ctx);
+        return;
+    }
+
     // ── Hapus log spesifik ───────────────────────────────────
     if (data.startsWith('hapus_log_')) {
         const logId = parseInt(data.replace('hapus_log_', ''));
@@ -1522,8 +1519,8 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             `💪 Protein: *${result.protein_g}g*\n` +
             `🍚 Karbo: *${result.carbs_g}g*\n` +
             `🥑 Lemak: *${result.fat_g}g*\n` +
-            `${result.confidence === 'low' ? '\n⚠️ _Confidence rendah, coba foto lebih jelas_\n' : ''}` +
-            `\n${buildSourceBadge(result)}\n\n` +
+            buildRangeAndDisclaimer(result) +
+            `\n\n${buildSourceBadge(result)}\n\n` +
             progTxt,
             {
                 parse_mode: 'Markdown',

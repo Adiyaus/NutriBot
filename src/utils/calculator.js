@@ -57,15 +57,18 @@ function calculateDailyGoal(tdee, deficit = parseInt(process.env.CALORIE_DEFICIT
  * Format ringkasan kalori buat dikirim ke Telegram
  */
 function formatCalorieReport(bmr, tdee, dailyGoal, activityLevel) {
-    const label = ACTIVITY_LABELS[activityLevel] || activityLevel;
+    const label        = ACTIVITY_LABELS[activityLevel] || activityLevel;
+    const deficit      = Math.max(0, Math.round(tdee - dailyGoal));
+    const weeklyLossKg = ((deficit * 7) / 7700).toFixed(1);
+
     return (
         `🔢 *Hasil Kalkulasi Lo:*\n\n` +
         `📊 BMR: *${bmr} kkal/hari*\n` +
-        `   _\\(kalori kalau rebahan doang\\)_\n\n` +
+        `   _(kalori kalau rebahan doang)_\n\n` +
         `⚡ TDEE: *${tdee} kkal/hari*\n` +
-        `   _\\(total sesuai aktivitas: ${label}\\)_\n\n` +
+        `   _(total sesuai aktivitas: ${label})_\n\n` +
         `🎯 Target Lo: *${dailyGoal} kkal/hari*\n` +
-        `   _\\(TDEE \\- 500 kkal → turun \\~0\\.5kg/minggu\\)_`
+        `   _(TDEE - ${deficit} kkal → turun ~${weeklyLossKg}kg/minggu)_`
     );
 }
 
