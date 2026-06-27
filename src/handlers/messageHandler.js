@@ -50,6 +50,22 @@ const MAIN_KEYBOARD = {
     }
 };
 
+/**
+ * Deteksi apakah error dari Telegram disebabkan oleh Markdown yang gagal di-parse
+ * (paling sering: ada karakter "*" atau "_" nyangkut/gak berpasangan di teks dinamis
+ * dari Gemini atau input user — bot gak bisa kontrol teks itu, jadi kita yang
+ * harus defensif di sisi pengiriman pesan)
+ */
+function _isMarkdownParseError(err) {
+    const msg = err?.response?.description || err?.description || err?.message || '';
+    return /can't parse entities/i.test(msg);
+}
+
+/**
+ * Wrapper aman buat reply() — kalau Markdown gagal di-parse, otomatis retry
+ * sebagai plain text (tanpa parse_mode) biar user tetep dapet hasilnya
+ * instead of pesan error generik.
+ */
 async function reply(ctx, text, extra = {}) {
     // Merge MAIN_KEYBOARD ke setiap reply — keyboard selalu muncul
     // Tapi kalau ada inline_keyboard di extra, jangan override reply_markup-nya
@@ -59,7 +75,33 @@ async function reply(ctx, text, extra = {}) {
         ? { parse_mode: 'Markdown', ...extra }                          // pakai inline keyboard dari caller
         : { parse_mode: 'Markdown', ...MAIN_KEYBOARD, ...extra };       // inject main keyboard
 
-    return ctx.reply(text, mergedExtra);
+    try {
+        return await ctx.reply(text, mergedExtra);
+    } catch (err) {
+        if (_isMarkdownParseError(err)) {
+            console.warn('[reply] Markdown parse gagal, retry plain text. Cause:', err?.response?.description || err.message);
+            const { parse_mode, ...plainExtra } = mergedExtra;
+            return await ctx.reply(text, plainExtra);
+        }
+        throw err;
+    }
+}
+
+/**
+ * Wrapper aman buat editMessageText (dipakai di hasil analisis foto & /catat)
+ * Sama kayak reply() — fallback ke plain text kalau Markdown gagal di-parse.
+ */
+async function safeEditMessageText(ctx, chatId, messageId, text, extra = {}) {
+    try {
+        return await ctx.telegram.editMessageText(chatId, messageId, null, text, extra);
+    } catch (err) {
+        if (_isMarkdownParseError(err)) {
+            console.warn('[safeEditMessageText] Markdown parse gagal, retry plain text. Cause:', err?.response?.description || err.message);
+            const { parse_mode, ...plainExtra } = extra;
+            return await ctx.telegram.editMessageText(chatId, messageId, null, text, plainExtra);
+        }
+        throw err;
+    }
 }
 
 // ─── HELPER: SOURCE BADGE ────────────────────────────────────
@@ -743,8 +785,8 @@ async function handleCatat(ctx) {
         const { bar, text: progTxt} = buildProgressSection(summary, user);
         const statusEmoji           = bar.isOver ? '🚨' : '✅';
 
-        await ctx.telegram.editMessageText(
-            ctx.chat.id, loadingMsg.message_id, null,
+        await safeEditMessageText(
+            ctx, ctx.chat.id, loadingMsg.message_id,
             `${statusEmoji} *Makanan Tercatat!*\n\n` +
             `📝 *${result.food_description}*\n\n` +
             `🔥 Kalori: *${result.calories} kkal*\n` +
@@ -1511,8 +1553,8 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
         const { bar, text: progTxt } = buildProgressSection(summary, user);
         const statusEmoji            = bar.isOver ? '🚨' : '✅';
 
-        await ctx.telegram.editMessageText(
-            ctx.chat.id, loadingMsg.message_id, null,
+        await safeEditMessageText(
+            ctx, ctx.chat.id, loadingMsg.message_id,
             `${statusEmoji} *Hasil Analisis Makanan:*\n\n` +
             `🍽️ *${result.food_description}*\n` +
             `\n🔥 Kalori: *${result.calories} kkal*\n` +
