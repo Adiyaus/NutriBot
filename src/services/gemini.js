@@ -329,6 +329,101 @@ PENTING: confidence SELALU "low" karena ini estimasi AI, bukan data database res
     }
 }
 
+// ─── EKSTRAKSI LABEL NUTRITION FACTS ──────────────────────────
+// NEW — OCR + parse tabel "Informasi Nilai Gizi" / "Nutrition Facts"
+// dari foto kemasan makanan/minuman. BEDA dari analyzeFoodImage:
+// di sini angka gizi diambil LANGSUNG dari label (bukan estimasi/
+// lookup database), karena labelnya sudah kasih data resmi.
+
+/**
+ * Ekstrak data nutrisi dari foto label kemasan
+ *
+ * @param {Buffer} imageBuffer
+ * @param {string} mimeType
+ * @returns {object} - label_detected, product_name, serving_size_text,
+ *                      servings_per_package, calories_per_serving,
+ *                      protein_per_serving_g, carbs_per_serving_g,
+ *                      fat_per_serving_g, confidence, notes, gemini_raw
+ */
+async function extractNutritionLabel(imageBuffer, mimeType = 'image/jpeg') {
+    const prompt = `
+Kamu adalah OCR + parser khusus tabel "Informasi Nilai Gizi" / "Nutrition Facts" pada label kemasan makanan/minuman.
+Tugasmu HANYA baca angka yang ADA di label tersebut. JANGAN mengarang atau mengestimasi angka — kalau ada nilai yang gak kebaca jelas, isi 0 dan sebutkan di notes.
+
+CARA BACA LABEL:
+- Cari baris "Takaran Saji" / "Serving Size" → ini serving_size_text (contoh: "1 bungkus (30 g)", "1 gelas (250 ml)")
+- Cari baris "Jumlah Sajian per Kemasan" / "Servings Per Container" → ini servings_per_package (kalau gak ketemu/gak kelihatan, pakai 1)
+- Ambil angka dari kolom "Per Sajian" / "Per Serving" — JANGAN pakai kolom "%AKG"/"%DV", dan JANGAN pakai kolom "Per 100g" kalau kebetulan ada dua kolom
+- "Energi Total" / "Energi" / "Calories" → calories_per_serving (satuan kkal/kcal)
+- "Protein" → protein_per_serving_g
+- "Karbohidrat Total" / "Total Carbohydrate" → carbs_per_serving_g
+- "Lemak Total" / "Total Fat" → fat_per_serving_g
+- Kalau nama produk kebaca jelas di kemasan → isi product_name, kalau enggak → kosongkan string-nya
+- Kalau foto ini BUKAN foto label nutrisi sama sekali (misal foto makanan biasa, atau foto random) → set label_detected: false dan field lain gak perlu diisi
+
+Balas HANYA JSON ini (tidak ada teks lain, tidak ada markdown code block):
+{
+  "label_detected": true,
+  "product_name": "nama produk kalau kebaca, kosongkan kalau tidak",
+  "serving_size_text": "1 bungkus (30 g)",
+  "servings_per_package": 1,
+  "calories_per_serving": 150,
+  "protein_per_serving_g": 2.5,
+  "carbs_per_serving_g": 18,
+  "fat_per_serving_g": 8,
+  "confidence": "high",
+  "notes": "catatan kalau ada angka yang kurang jelas terbaca, kosongkan kalau semua jelas"
+}
+    `.trim();
+
+    try {
+        const base64Image = imageBuffer.toString('base64');
+        const rawText = await callGemini([{
+            role: 'user',
+            parts: [
+                { text: prompt },
+                { inlineData: { mimeType, data: base64Image } }
+            ]
+        }]);
+        return parseLabelResponse(rawText);
+    } catch (err) {
+        handleGeminiError(err);
+    }
+}
+
+function parseLabelResponse(rawText) {
+    const cleaned = rawText
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+        .trim();
+
+    let parsed;
+    try {
+        parsed = JSON.parse(cleaned);
+    } catch {
+        console.error('[Gemini] parseLabelResponse error:', cleaned);
+        throw new Error('PARSE_ERROR');
+    }
+
+    if (!parsed.label_detected) {
+        return { label_detected: false };
+    }
+
+    return {
+        label_detected:        true,
+        product_name:          (parsed.product_name || '').trim(),
+        serving_size_text:     (parsed.serving_size_text || '').trim(),
+        servings_per_package:  Math.max(1, Math.round(Number(parsed.servings_per_package) || 1)),
+        calories_per_serving:  Math.max(0, Math.round(Number(parsed.calories_per_serving) || 0)),
+        protein_per_serving_g: Math.max(0, parseFloat((Number(parsed.protein_per_serving_g) || 0).toFixed(1))),
+        carbs_per_serving_g:   Math.max(0, parseFloat((Number(parsed.carbs_per_serving_g)   || 0).toFixed(1))),
+        fat_per_serving_g:     Math.max(0, parseFloat((Number(parsed.fat_per_serving_g)     || 0).toFixed(1))),
+        confidence:            parsed.confidence || 'medium',
+        notes:                 parsed.notes || '',
+        gemini_raw:            rawText
+    };
+}
+
 // ─── COACH ANSWER ─────────────────────────────────────────────
 // TIDAK BERUBAH
 
@@ -440,6 +535,7 @@ module.exports = {
     analyzeFoodImage,
     estimateNutritionFromText,
     estimateSingleFood,      // NEW — last-resort per-item estimator
+    extractNutritionLabel,   // NEW — OCR label "Informasi Nilai Gizi" / Nutrition Facts
     generateCoachAnswer,
     downloadImage,
 };

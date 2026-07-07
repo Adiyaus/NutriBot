@@ -18,6 +18,10 @@ const saveMenuModeMap = new Map();
 const inputModeMap    = new Map();
 const photoContextMap = new Map();
 
+// ── NEW: Scan Nutrition Facts (label kemasan) ──────────────────
+const labelScanModeMap = new Map(); // tgId -> true, nunggu foto label dikirim
+const labelFlowMap     = new Map(); // tgId -> { stage: 'awaiting_serving'|'awaiting_name', label, multiplier }
+
 // ── New micro-features ────────────────────────────────────────
 const { buildProgressBar: buildProgressBarUtil } = require('../utils/progressBar');
 const { generateAndSendInsight }                 = require('../services/coachInsight');
@@ -34,9 +38,11 @@ const coachHistoryMap = new Map(); // simpan history percakapan /tanya per user
 const MAIN_KEYBOARD = {
     reply_markup: {
         keyboard: [
-            // Baris 1: tracking harian
-            ['📸 Kirim Foto', '/catat', '/input'],
-            // Baris 2: cek status
+            // Baris 1: tracking harian (foto & scan label)
+            ['📸 Kirim Foto', '/scanlabel'],
+            // Baris 2: catat manual
+            ['/catat', '/input'],
+            // Baris 3: cek status
             ['/status', '/laporan', '/streak'],
             // Baris 3: menu & tools
             ['/menu', '/tanya', '/target'],
@@ -134,6 +140,8 @@ function buildSourceBadge(result) {
             return `_⚠️ Estimasi AI — data resmi tidak tersedia_ 🤖`;
         case 'gemini_estimate_mixed':
             return `_⚠️ Estimasi AI sebagian${coverage}_ 🤖`;
+        case 'nutrition_label':
+            return `_✅ Data resmi dari label kemasan_ 🏷️`;
         // ── Source lama (backward compat) ────────────────────
         case 'usda_primary':
             return `_✅ Kalori dari USDA FoodData (${result.usda_coverage})_ 🔬`;
@@ -260,6 +268,7 @@ async function handleHelp(ctx) {
         `*/menu* — lihat & pilih menu tersimpan\n` +
         `*/catat [makanan]* — log makanan tanpa foto\n` +
         `*/input* — input nutrisi manual (template)\n` +
+        `*/scanlabel* — scan foto label "Informasi Nilai Gizi" di kemasan\n` +
         `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
         `*/lupain* — reset history percakapan coach\n` +
         `*/profil* — lihat & update data profil\n` +
@@ -719,6 +728,8 @@ async function handleCatat(ctx) {
     editModeMap.delete(tgId);
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
+    labelScanModeMap.delete(tgId);
+    labelFlowMap.delete(tgId);
 
     // Ambil teks setelah "/catat "
     const fullText  = ctx.message.text || '';
@@ -837,6 +848,18 @@ async function handleText(ctx) {
         return;
     }
 
+    // ── Mode: scan label nutrisi — nunggu nama makanan ───────
+    const labelFlow = labelFlowMap.get(tgId);
+    if (labelFlow?.stage === 'awaiting_name') {
+        await handleLabelNameInput(ctx, tgId, body, labelFlow);
+        return;
+    }
+    // ── Mode: scan label nutrisi — masih nunggu pilihan porsi ──
+    if (labelFlow?.stage === 'awaiting_serving') {
+        await reply(ctx, `Pilih salah satu tombol di atas dulu ya 👆\n_(atau /batal buat cancel)_`);
+        return;
+    }
+
     // ── Mode: input manual nutrisi ───────────────────────────
     if (inputModeMap.has(tgId)) {
         await handleInputStep(ctx, tgId, body);
@@ -868,6 +891,8 @@ async function handleText(ctx) {
         inputModeMap.delete(tgId);
         editModeMap.delete(tgId);
         photoContextMap.delete(tgId);
+        labelScanModeMap.delete(tgId);
+        labelFlowMap.delete(tgId);
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
     }
@@ -1251,6 +1276,27 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
+    // ── Pilihan porsi setelah scan label nutrisi ─────────────
+    if (data === 'label_serving_1' || data === 'label_serving_all') {
+        const flow = labelFlowMap.get(tgId);
+        if (!flow) {
+            await ctx.editMessageText(`Sesi scan-nya udah expired. Ketik /scanlabel lagi ya! 🏷️`);
+            return;
+        }
+
+        flow.multiplier = data === 'label_serving_all' ? flow.label.servings_per_package : 1;
+        flow.stage      = 'awaiting_name';
+        labelFlowMap.set(tgId, flow);
+
+        await ctx.editMessageText(
+            `Oke, ${flow.multiplier}x sajian ya! ✅\n\n` +
+            `*Mau dicatat sebagai apa nih?*\n` +
+            `_(contoh: "${flow.label.product_name || 'nama makanan/minumannya'}")_`,
+            { parse_mode: 'Markdown' }
+        );
+        return;
+    }
+
     // ── Update profil ────────────────────────────────────────
     if (data === 'update_profile') {
         await db.upsertUser(tgId, { registration_step: 'ask_name', is_registered: false });
@@ -1454,12 +1500,20 @@ async function handlePhoto(ctx) {
         return;
     }
 
+    // ── Mode: scan label nutrisi aktif → route ke handler khusus ──
+    if (labelScanModeMap.has(tgId)) {
+        labelScanModeMap.delete(tgId);
+        await handleLabelPhoto(ctx, tgId);
+        return;
+    }
+
     // Clear semua mode yang aktif
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
     inputModeMap.delete(tgId);
     editModeMap.delete(tgId);
     photoContextMap.delete(tgId);
+    labelFlowMap.delete(tgId);
 
     try {
         // Ambil file info foto dulu — simpan ke memory buat diproses setelah konteks
@@ -1589,6 +1643,205 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
 
         await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
             .catch(() => reply(ctx, errMsg));
+    }
+}
+
+// ─── NEW: SCAN NUTRITION FACTS (LABEL KEMASAN) ───────────────
+
+/**
+ * /scanlabel — mulai alur scan label "Informasi Nilai Gizi" di kemasan
+ * Alur: pilih opsi ini → kirim foto label → bot ekstrak angka →
+ *       user kasih nama makanan/minumannya → kesimpen ke log
+ */
+async function handleScanLabel(ctx) {
+    const tgId = ctx.from.id;
+    const user = await db.getUser(tgId);
+
+    if (!user?.is_registered) {
+        await reply(ctx, `Lo belum daftar nih! 😅 Ketik /mulai dulu ya.`);
+        return;
+    }
+
+    // Clear semua mode lain yang mungkin aktif — biar gak bentrok
+    adjustModeMap.delete(tgId);
+    saveMenuModeMap.delete(tgId);
+    inputModeMap.delete(tgId);
+    editModeMap.delete(tgId);
+    photoContextMap.delete(tgId);
+    labelFlowMap.delete(tgId);
+
+    labelScanModeMap.set(tgId, true);
+
+    await reply(ctx,
+        `🏷️ *Scan Label Nutrisi*\n\n` +
+        `Kirim foto tabel *"Informasi Nilai Gizi"* / *"Nutrition Facts"* di kemasannya ya! 📸\n\n` +
+        `_Pastiin angka-angkanya kebaca jelas & gak buram biar hasilnya akurat._\n\n` +
+        `_Ketik /batal buat cancel_`
+    );
+}
+
+/**
+ * Core: download foto label → ekstrak via Gemini vision → tampilkan hasil
+ * Kalau servings_per_package > 1, tanya dulu berapa porsi yang dimakan.
+ * Kalau cuma 1, langsung lanjut tanya nama makanan.
+ */
+async function handleLabelPhoto(ctx, tgId) {
+    const loadingMsg = await ctx.reply(
+        `Sebentar ya... 🔍\n_Membaca label nutrisi..._`,
+        { parse_mode: 'Markdown' }
+    );
+
+    try {
+        const photos    = ctx.message.photo;
+        const bestPhoto = photos[photos.length - 1];
+        const fileInfo  = await ctx.telegram.getFile(bestPhoto.file_id);
+        const fileUrl   = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+
+        const imageBuffer = await gemini.downloadImage(fileUrl);
+        const label       = await gemini.extractNutritionLabel(imageBuffer);
+
+        if (!label.label_detected) {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id, loadingMsg.message_id, null,
+                `Hmm, gua gak nemu tabel "Informasi Nilai Gizi" di foto ini... 🤔\n\n` +
+                `Coba foto ulang, pastiin tabel nutrisinya kelihatan jelas & gak kepotong ya! 📸\n` +
+                `_Ketik /scanlabel buat coba lagi_`
+            );
+            return;
+        }
+
+        // Simpan hasil ekstraksi ke memory, tunggu step berikutnya
+        const needsServingChoice = label.servings_per_package > 1;
+        labelFlowMap.set(tgId, {
+            stage: needsServingChoice ? 'awaiting_serving' : 'awaiting_name',
+            label,
+            multiplier: 1
+        });
+
+        const extractedText =
+            `✅ *Data Berhasil Diekstrak!*\n\n` +
+            (label.product_name ? `🏷️ *${label.product_name}*\n\n` : '') +
+            (label.serving_size_text ? `📏 Takaran saji: *${label.serving_size_text}*\n` : '') +
+            (needsServingChoice ? `📦 Sajian per kemasan: *${label.servings_per_package}*\n` : '') +
+            `\n*Nilai Gizi per Sajian:*\n` +
+            `🔥 Kalori: *${label.calories_per_serving} kkal*\n` +
+            `💪 Protein: *${label.protein_per_serving_g}g*\n` +
+            `🍚 Karbo: *${label.carbs_per_serving_g}g*\n` +
+            `🥑 Lemak: *${label.fat_per_serving_g}g*\n` +
+            (label.notes ? `\n📌 _${label.notes}_\n` : '');
+
+        if (needsServingChoice) {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id, loadingMsg.message_id, null,
+                extractedText + `\n*Lo makan/minum berapa banyak?*`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: '1 Sajian',                                   callback_data: 'label_serving_1'   },
+                            { text: `Semua Kemasan (${label.servings_per_package}x)`, callback_data: 'label_serving_all' }
+                        ]]
+                    }
+                }
+            );
+            return;
+        }
+
+        // Cuma 1 sajian per kemasan → langsung lanjut tanya nama makanan
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, null,
+            extractedText + `\n*Mau dicatat sebagai apa nih?*\n` +
+            `_(contoh: "${label.product_name || 'nama makanan/minumannya'}")_`,
+            { parse_mode: 'Markdown' }
+        );
+
+    } catch (err) {
+        console.error(`[LabelScanHandler] Error for ${tgId}:`, err.message);
+        labelFlowMap.delete(tgId);
+        const errMsg = {
+            'RATE_LIMIT':   `⏳ Gemini overload. Tunggu ~1 menit ya!`,
+            'SAFETY_BLOCK': `🚫 Gambar gak bisa diproses.`,
+            'GEMINI_ERROR': `😵 Ada error. Coba kirim ulang!`,
+            'PARSE_ERROR':  `😵 Gagal baca label. Coba foto yang lebih jelas & gak buram!`,
+        }[err.message] || `❌ Something went wrong. Coba lagi!`;
+
+        await ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, null, errMsg)
+            .catch(() => reply(ctx, errMsg));
+    }
+}
+
+/**
+ * Handle input nama makanan setelah label diekstrak
+ * Dipanggil dari handleText waktu labelFlowMap.stage === 'awaiting_name'
+ * Di sinilah log akhirnya kesimpen ke database.
+ */
+async function handleLabelNameInput(ctx, tgId, foodName, flow) {
+    if (!foodName || foodName.length < 2) {
+        await reply(ctx, `Nama makanan/minumannya minimal 2 karakter ya. Coba lagi!`);
+        return;
+    }
+    if (foodName.length > 150) {
+        await reply(ctx, `Nama makanannya kepanjangan (max 150 karakter). Coba lagi!`);
+        return;
+    }
+
+    labelFlowMap.delete(tgId);
+
+    const user = await db.getUser(tgId);
+    const { label, multiplier } = flow;
+
+    const calories  = Math.round(label.calories_per_serving  * multiplier);
+    const protein_g = parseFloat((label.protein_per_serving_g * multiplier).toFixed(1));
+    const carbs_g   = parseFloat((label.carbs_per_serving_g   * multiplier).toFixed(1));
+    const fat_g     = parseFloat((label.fat_per_serving_g     * multiplier).toFixed(1));
+
+    const portionNote = multiplier > 1
+        ? ` (${multiplier}x sajian)`
+        : (label.serving_size_text ? ` (${label.serving_size_text})` : '');
+    const food_description = `${foodName}${portionNote}`;
+
+    try {
+        const savedLog = await db.insertFoodLog(tgId, {
+            food_description,
+            calories, protein_g, carbs_g, fat_g,
+            gemini_raw: label.gemini_raw || null
+        });
+
+        lastLogIdMap.set(tgId, savedLog.id);
+        const fakeResult = {
+            food_description, calories, protein_g, carbs_g, fat_g,
+            data_source: 'nutrition_label'
+        };
+        lastResultMap.set(tgId, fakeResult);
+
+        const summary                = await db.getDailySummary(tgId);
+        const { bar, text: progTxt } = buildProgressSection(summary, user);
+        const statusEmoji            = bar.isOver ? '🚨' : '✅';
+
+        await reply(ctx,
+            `${statusEmoji} *Makanan Tercatat!*\n\n` +
+            `🍽️ *${food_description}*\n\n` +
+            `🔥 Kalori: *${calories} kkal*\n` +
+            `💪 Protein: *${protein_g}g*\n` +
+            `🍚 Karbo: *${carbs_g}g*\n` +
+            `🥑 Lemak: *${fat_g}g*\n\n` +
+            `${buildSourceBadge(fakeResult)}\n\n` +
+            progTxt,
+            {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '💾 Simpan ke Menu', callback_data: 'save_to_menu' },
+                        { text: '✏️ Koreksi',        callback_data: 'adjust_last'  }
+                    ]]
+                }
+            }
+        );
+
+        fireInsight(ctx, user, fakeResult, summary);
+
+    } catch (err) {
+        console.error(`[LabelNameInput] Error for ${tgId}:`, err.message);
+        await reply(ctx, `❌ Gagal nyimpen log. Coba lagi ya!`);
     }
 }
 
@@ -2068,6 +2321,8 @@ function resetDailyMemory() {
     inputModeMap.clear();
     photoContextMap.clear();
     coachHistoryMap.clear();
+    labelScanModeMap.clear();
+    labelFlowMap.clear();
     console.log('[Memory] Daily reset — semua state map cleared');
 }
 
@@ -2076,6 +2331,7 @@ module.exports = {
     handleProfil, handleReset, handleHapus, handleAdjust,
     handleStreak, handleTarget, handleRemind,
     handleMenu, handleCatat, handleInput, handleTanya, handleLupain,
+    handleScanLabel,
     handleText, handleCallbackQuery, handlePhoto,
     resetDailyMemory
 };

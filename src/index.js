@@ -10,6 +10,7 @@ const {
     handleProfil, handleReset, handleHapus, handleAdjust,
     handleStreak, handleTarget, handleRemind,
     handleMenu, handleCatat, handleInput, handleTanya, handleLupain,
+    handleScanLabel,
     handleText, handleCallbackQuery, handlePhoto
 } = require('./handlers/messageHandler');
 
@@ -31,6 +32,7 @@ bot.command('remind',  handleRemind);
 bot.command('menu',    handleMenu);
 bot.command('catat',   handleCatat);
 bot.command('input',   handleInput);
+bot.command('scanlabel', handleScanLabel);
 bot.command('tanya',   handleTanya);
 bot.command('lupain',  handleLupain);
 
