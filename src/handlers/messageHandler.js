@@ -19,8 +19,8 @@ const inputModeMap    = new Map();
 const photoContextMap = new Map();
 
 // ── NEW: Scan Nutrition Facts (label kemasan) ──────────────────
-const labelScanModeMap = new Map(); // tgId -> true, nunggu foto label dikirim
-const labelFlowMap     = new Map(); // tgId -> { stage: 'awaiting_serving'|'awaiting_name', label, multiplier }
+const photoChoiceMap = new Map(); // tgId -> { fileUrl }, nunggu user pilih mode (makanan/label)
+const labelFlowMap   = new Map(); // tgId -> { stage: 'awaiting_serving'|'awaiting_name', label, multiplier }
 
 // ── New micro-features ────────────────────────────────────────
 const { buildProgressBar: buildProgressBarUtil } = require('../utils/progressBar');
@@ -268,7 +268,7 @@ async function handleHelp(ctx) {
         `*/menu* — lihat & pilih menu tersimpan\n` +
         `*/catat [makanan]* — log makanan tanpa foto\n` +
         `*/input* — input nutrisi manual (template)\n` +
-        `*/scanlabel* — scan foto label "Informasi Nilai Gizi" di kemasan\n` +
+        `*/scanlabel* — cara scan label "Informasi Nilai Gizi" di kemasan\n` +
         `*/tanya [pertanyaan]* — tanya coach soal diet & nutrisi\n` +
         `*/lupain* — reset history percakapan coach\n` +
         `*/profil* — lihat & update data profil\n` +
@@ -276,7 +276,7 @@ async function handleHelp(ctx) {
         `*/hapus* — hapus 1 log spesifik hari ini\n` +
         `*/adjust* — koreksi log terakhir (nama/angka)\n` +
         `*/help* — tampilkan menu ini\n\n` +
-        `📸 *Kirim foto makanan* → auto analisis + opsi simpan ke menu!\n\n` +
+        `📸 *Kirim foto apa aja* — nanti dipilih mau dianalisis sebagai makanan atau discan label gizinya! 🍽️ / 🏷️\n\n` +
         `_Powered by Gemini 2.5 Flash_ 🤖`
     );
 }
@@ -728,7 +728,7 @@ async function handleCatat(ctx) {
     editModeMap.delete(tgId);
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
-    labelScanModeMap.delete(tgId);
+    photoChoiceMap.delete(tgId);
     labelFlowMap.delete(tgId);
 
     // Ambil teks setelah "/catat "
@@ -891,7 +891,7 @@ async function handleText(ctx) {
         inputModeMap.delete(tgId);
         editModeMap.delete(tgId);
         photoContextMap.delete(tgId);
-        labelScanModeMap.delete(tgId);
+        photoChoiceMap.delete(tgId);
         labelFlowMap.delete(tgId);
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
@@ -1263,6 +1263,45 @@ async function handleCallbackQuery(ctx) {
         return;
     }
 
+    // ── Pilih jenis foto: analisis makanan atau scan label gizi ──
+    if (data === 'photo_mode_food') {
+        const photoData = photoChoiceMap.get(tgId);
+        if (!photoData) {
+            await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
+            return;
+        }
+        photoChoiceMap.delete(tgId);
+        photoContextMap.set(tgId, { fileUrl: photoData.fileUrl });
+
+        await ctx.editMessageText(
+            `🍽️ *Analisis Makanan*\n\n` +
+            `*Ada info tambahan tentang makanannya?*\n` +
+            `_(contoh: "nasi goreng spesial warung bu Tini", "porsi besar", "pakai santan")_\n\n` +
+            `Info tambahan bikin estimasi lebih akurat! 🎯`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '⚡ Skip, langsung analisis', callback_data: 'photo_skip_context' }
+                    ]]
+                }
+            }
+        );
+        return;
+    }
+
+    if (data === 'photo_mode_label') {
+        const photoData = photoChoiceMap.get(tgId);
+        if (!photoData) {
+            await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
+            return;
+        }
+        photoChoiceMap.delete(tgId);
+        await ctx.editMessageText(`🏷️ Oke, scan label nutrisi... 🔍`);
+        await processLabelAnalysis(ctx, tgId, photoData.fileUrl);
+        return;
+    }
+
     // ── Skip konteks foto — langsung analisis tanpa konteks ──
     if (data === 'photo_skip_context') {
         await ctx.answerCbQuery();
@@ -1280,7 +1319,7 @@ async function handleCallbackQuery(ctx) {
     if (data === 'label_serving_1' || data === 'label_serving_all') {
         const flow = labelFlowMap.get(tgId);
         if (!flow) {
-            await ctx.editMessageText(`Sesi scan-nya udah expired. Ketik /scanlabel lagi ya! 🏷️`);
+            await ctx.editMessageText(`Sesi scan-nya udah expired. Kirim ulang fotonya ya! 📸`);
             return;
         }
 
@@ -1500,13 +1539,6 @@ async function handlePhoto(ctx) {
         return;
     }
 
-    // ── Mode: scan label nutrisi aktif → route ke handler khusus ──
-    if (labelScanModeMap.has(tgId)) {
-        labelScanModeMap.delete(tgId);
-        await handleLabelPhoto(ctx, tgId);
-        return;
-    }
-
     // Clear semua mode yang aktif
     adjustModeMap.delete(tgId);
     saveMenuModeMap.delete(tgId);
@@ -1514,28 +1546,26 @@ async function handlePhoto(ctx) {
     editModeMap.delete(tgId);
     photoContextMap.delete(tgId);
     labelFlowMap.delete(tgId);
+    photoChoiceMap.delete(tgId);
 
     try {
-        // Ambil file info foto dulu — simpan ke memory buat diproses setelah konteks
+        // Ambil file info foto dulu — simpan ke memory, tunggu user pilih mode analisis
         const photos    = ctx.message.photo;
         const bestPhoto = photos[photos.length - 1];
         const fileInfo  = await ctx.telegram.getFile(bestPhoto.file_id);
         const fileUrl   = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
-        // Simpan foto ke memory, tunggu konteks dari user
-        photoContextMap.set(tgId, { fileUrl });
+        photoChoiceMap.set(tgId, { fileUrl });
 
-        // Tanya konteks — pakai inline keyboard buat opsi skip
+        // Tanya dulu ini foto apa — makanan biasa atau label nutrisi
         await ctx.reply(
-            `📸 Foto diterima!\n\n` +
-            `*Ada info tambahan tentang makanannya?*\n` +
-            `_(contoh: "nasi goreng spesial warung bu Tini", "porsi besar", "pakai santan")_\n\n` +
-            `Info tambahan bikin estimasi lebih akurat! 🎯`,
+            `📸 Foto diterima!\n\n*Ini foto apa nih?*`,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
                     inline_keyboard: [[
-                        { text: '⚡ Skip, langsung analisis', callback_data: 'photo_skip_context' }
+                        { text: '🍽️ Analisis Makanan',  callback_data: 'photo_mode_food'  },
+                        { text: '🏷️ Scan Label Gizi',    callback_data: 'photo_mode_label' }
                     ]]
                 }
             }
@@ -1649,9 +1679,9 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
 // ─── NEW: SCAN NUTRITION FACTS (LABEL KEMASAN) ───────────────
 
 /**
- * /scanlabel — mulai alur scan label "Informasi Nilai Gizi" di kemasan
- * Alur: pilih opsi ini → kirim foto label → bot ekstrak angka →
- *       user kasih nama makanan/minumannya → kesimpen ke log
+ * /scanlabel — shortcut info. Sekarang user gak perlu declare intent dulu:
+ * tinggal kirim foto langsung, bot bakal nanya mau dianalisis sebagai
+ * makanan biasa atau discan label gizinya lewat tombol pilihan.
  */
 async function handleScanLabel(ctx) {
     const tgId = ctx.from.id;
@@ -1662,21 +1692,10 @@ async function handleScanLabel(ctx) {
         return;
     }
 
-    // Clear semua mode lain yang mungkin aktif — biar gak bentrok
-    adjustModeMap.delete(tgId);
-    saveMenuModeMap.delete(tgId);
-    inputModeMap.delete(tgId);
-    editModeMap.delete(tgId);
-    photoContextMap.delete(tgId);
-    labelFlowMap.delete(tgId);
-
-    labelScanModeMap.set(tgId, true);
-
     await reply(ctx,
         `🏷️ *Scan Label Nutrisi*\n\n` +
-        `Kirim foto tabel *"Informasi Nilai Gizi"* / *"Nutrition Facts"* di kemasannya ya! 📸\n\n` +
-        `_Pastiin angka-angkanya kebaca jelas & gak buram biar hasilnya akurat._\n\n` +
-        `_Ketik /batal buat cancel_`
+        `Gampang — tinggal kirim aja foto tabel *"Informasi Nilai Gizi"* / *"Nutrition Facts"*-nya langsung! 📸\n\n` +
+        `Begitu fotonya masuk, gua bakal tanya dulu itu foto apa — nanti pilih *"🏷️ Scan Label Gizi"* ya. 😊`
     );
 }
 
@@ -1684,19 +1703,17 @@ async function handleScanLabel(ctx) {
  * Core: download foto label → ekstrak via Gemini vision → tampilkan hasil
  * Kalau servings_per_package > 1, tanya dulu berapa porsi yang dimakan.
  * Kalau cuma 1, langsung lanjut tanya nama makanan.
+ *
+ * Dipanggil dari callback 'photo_mode_label' setelah user pilih mode di
+ * chooser — fileUrl sudah di-resolve sebelumnya di handlePhoto.
  */
-async function handleLabelPhoto(ctx, tgId) {
+async function processLabelAnalysis(ctx, tgId, fileUrl) {
     const loadingMsg = await ctx.reply(
         `Sebentar ya... 🔍\n_Membaca label nutrisi..._`,
         { parse_mode: 'Markdown' }
     );
 
     try {
-        const photos    = ctx.message.photo;
-        const bestPhoto = photos[photos.length - 1];
-        const fileInfo  = await ctx.telegram.getFile(bestPhoto.file_id);
-        const fileUrl   = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
-
         const imageBuffer = await gemini.downloadImage(fileUrl);
         const label       = await gemini.extractNutritionLabel(imageBuffer);
 
@@ -1704,8 +1721,7 @@ async function handleLabelPhoto(ctx, tgId) {
             await ctx.telegram.editMessageText(
                 ctx.chat.id, loadingMsg.message_id, null,
                 `Hmm, gua gak nemu tabel "Informasi Nilai Gizi" di foto ini... 🤔\n\n` +
-                `Coba foto ulang, pastiin tabel nutrisinya kelihatan jelas & gak kepotong ya! 📸\n` +
-                `_Ketik /scanlabel buat coba lagi_`
+                `Coba kirim ulang fotonya, pastiin tabel nutrisinya kelihatan jelas & gak kepotong ya! 📸`
             );
             return;
         }
@@ -2321,7 +2337,7 @@ function resetDailyMemory() {
     inputModeMap.clear();
     photoContextMap.clear();
     coachHistoryMap.clear();
-    labelScanModeMap.clear();
+    photoChoiceMap.clear();
     labelFlowMap.clear();
     console.log('[Memory] Daily reset — semua state map cleared');
 }
