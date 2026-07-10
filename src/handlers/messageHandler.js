@@ -10,17 +10,13 @@ const calc     = require('../utils/calculator');
 const off      = require('../services/openfoodfacts');
 const resolver = require('../services/nutritionResolver');
 
-const lastLogIdMap    = new Map();
-const lastResultMap   = new Map();
-const adjustModeMap   = new Map();
-const editModeMap     = new Map();
-const saveMenuModeMap = new Map();
-const inputModeMap    = new Map();
-const photoContextMap = new Map();
-
-// ── NEW: Scan Nutrition Facts (label kemasan) ──────────────────
-const photoChoiceMap = new Map(); // tgId -> { fileUrl }, nunggu user pilih mode (makanan/label)
-const labelFlowMap   = new Map(); // tgId -> { stage: 'awaiting_serving'|'awaiting_name', label, multiplier }
+// ── State transaksional (log terakhir, mode adjust/edit/input/save-menu)
+// disimpen di DB (bot_sessions) — BUKAN Map() lokal — karena semuanya
+// butuh survive antar-request. Vercel serverless bisa nge-spin instance
+// baru tiap request, jadi Map() lokal gak reliable buat state ini.
+// Session keys: 'last_log_id' | 'last_result' | 'adjust_mode' |
+//               'edit_mode' | 'save_menu_mode' | 'input_mode' |
+//               'photo_choice' | 'photo_context' | 'label_flow'
 
 // ── New micro-features ────────────────────────────────────────
 const { buildProgressBar: buildProgressBarUtil } = require('../utils/progressBar');
@@ -448,10 +444,10 @@ async function handleHapus(ctx) {
 }
 
 async function handleAdjust(ctx) {
-    const tgId      = ctx.from.id;
-    const user      = await db.getUser(tgId);
-    const lastLogId = lastLogIdMap.get(tgId);
-    const lastResult = lastResultMap.get(tgId);
+    const tgId       = ctx.from.id;
+    const user       = await db.getUser(tgId);
+    const lastLogId  = await db.getSession(tgId, 'last_log_id');
+    const lastResult = await db.getSession(tgId, 'last_result');
 
     if (!user?.is_registered) {
         await reply(ctx, `Lo belum daftar nih! Ketik /mulai dulu ya.`);
@@ -724,12 +720,8 @@ async function handleCatat(ctx) {
     }
 
     // Clear semua mode yang mungkin aktif — biar gak ada konflik state
-    inputModeMap.delete(tgId);
-    editModeMap.delete(tgId);
-    adjustModeMap.delete(tgId);
-    saveMenuModeMap.delete(tgId);
-    photoChoiceMap.delete(tgId);
-    labelFlowMap.delete(tgId);
+    // (last_log_id/last_result TETAP disimpen biar /adjust masih nyambung ke log sebelumnya)
+    await db.clearModeSessions(tgId);
 
     // Ambil teks setelah "/catat "
     const fullText  = ctx.message.text || '';
@@ -787,9 +779,9 @@ async function handleCatat(ctx) {
             gemini_raw:       result.gemini_raw
         });
 
-        // Simpan ke memory buat fitur simpan ke menu
-        lastLogIdMap.set(tgId, savedLog.id);
-        lastResultMap.set(tgId, result);
+        // Simpan ke session (DB) buat fitur simpan ke menu / adjust
+        await db.setSession(tgId, 'last_log_id', savedLog.id);
+        await db.setSession(tgId, 'last_result', result);
 
         // Hitung sisa kalori + progress bar
         const summary               = await db.getDailySummary(tgId);
@@ -841,15 +833,27 @@ async function handleText(ctx) {
     const body = ctx.message.text?.trim() || '';
     const user = await db.getUser(tgId);
 
+    // Ambil semua kemungkinan state "nunggu step lanjutan" sekaligus
+    // (1 round-trip paralel, bukan berurutan) — semua disimpen di DB
+    // (bot_sessions) biar survive antar-request di serverless.
+    const [photoContextData, labelFlow, inputState, editState, saveMenuFlag, adjustLogId] =
+        await Promise.all([
+            db.getSession(tgId, 'photo_context'),
+            db.getSession(tgId, 'label_flow'),
+            db.getSession(tgId, 'input_mode'),
+            db.getSession(tgId, 'edit_mode'),
+            db.getSession(tgId, 'save_menu_mode'),
+            db.getSession(tgId, 'adjust_mode'),
+        ]);
+
     // ── Mode: nunggu konteks foto ────────────────────────────
     // Dicek PERTAMA biar gak bentrok sama mode lain
-    if (photoContextMap.has(tgId)) {
-        await handlePhotoContext(ctx, tgId, body);
+    if (photoContextData) {
+        await handlePhotoContext(ctx, tgId, body, photoContextData);
         return;
     }
 
     // ── Mode: scan label nutrisi — nunggu nama makanan ───────
-    const labelFlow = labelFlowMap.get(tgId);
     if (labelFlow?.stage === 'awaiting_name') {
         await handleLabelNameInput(ctx, tgId, body, labelFlow);
         return;
@@ -861,38 +865,32 @@ async function handleText(ctx) {
     }
 
     // ── Mode: input manual nutrisi ───────────────────────────
-    if (inputModeMap.has(tgId)) {
-        await handleInputStep(ctx, tgId, body);
+    if (inputState) {
+        await handleInputStep(ctx, tgId, body, inputState);
         return;
     }
 
     // ── Mode: edit angka nutrisi ─────────────────────────────
-    if (editModeMap.has(tgId)) {
-        await handleEditStep(ctx, tgId, body);
+    if (editState) {
+        await handleEditStep(ctx, tgId, body, editState);
         return;
     }
 
     // ── Mode: input nama menu buat disimpan ──────────────────
-    if (saveMenuModeMap.has(tgId)) {
+    if (saveMenuFlag) {
         await handleSaveMenuInput(ctx, tgId, body);
         return;
     }
 
     // ── Mode: adjust deskripsi ───────────────────────────────
-    if (adjustModeMap.has(tgId)) {
-        await handleAdjustInput(ctx, tgId, body);
+    if (adjustLogId) {
+        await handleAdjustInput(ctx, tgId, body, adjustLogId);
         return;
     }
 
     // ── Cancel commands ──────────────────────────────────────
     if (body.toLowerCase() === '/batal' || body.toLowerCase() === 'batal') {
-        adjustModeMap.delete(tgId);
-        saveMenuModeMap.delete(tgId);
-        inputModeMap.delete(tgId);
-        editModeMap.delete(tgId);
-        photoContextMap.delete(tgId);
-        photoChoiceMap.delete(tgId);
-        labelFlowMap.delete(tgId);
+        await db.clearModeSessions(tgId); // hapus mode aktif, last_log_id/last_result TETAP disimpen
         await reply(ctx, `Oke, dibatalin! 👌`);
         return;
     }
@@ -925,11 +923,11 @@ async function handleSaveMenuInput(ctx, tgId, menuName) {
         return;
     }
 
-    // Ambil data nutrisi dari last result Gemini yang disimpan di memory
-    const lastResult = lastResultMap.get(tgId);
+    // Ambil data nutrisi dari last result Gemini yang disimpan di session (DB)
+    const lastResult = await db.getSession(tgId, 'last_result');
 
     if (!lastResult) {
-        saveMenuModeMap.delete(tgId);
+        await db.deleteSession(tgId, 'save_menu_mode');
         await reply(ctx, `😵 Data analisis udah expired. Kirim foto lagi ya!`);
         return;
     }
@@ -944,7 +942,7 @@ async function handleSaveMenuInput(ctx, tgId, menuName) {
             fat_g:            lastResult.fat_g
         });
 
-        saveMenuModeMap.delete(tgId); // keluar dari save menu mode
+        await db.deleteSession(tgId, 'save_menu_mode'); // keluar dari save menu mode
 
         await reply(ctx,
             `✅ *Menu "${menuName}" tersimpan!*\n\n` +
@@ -959,9 +957,7 @@ async function handleSaveMenuInput(ctx, tgId, menuName) {
     }
 }
 
-async function handleAdjustInput(ctx, tgId, newDescription) {
-    const logId = adjustModeMap.get(tgId);
-
+async function handleAdjustInput(ctx, tgId, newDescription, logId) {
     if (!newDescription || newDescription.length < 3) {
         await reply(ctx, `Deskripsinya terlalu pendek. Coba tulis lebih detail!`);
         return;
@@ -969,11 +965,13 @@ async function handleAdjustInput(ctx, tgId, newDescription) {
 
     try {
         await db.updateFoodLogDescription(logId, newDescription);
-        adjustModeMap.delete(tgId);
+        await db.deleteSession(tgId, 'adjust_mode');
 
         // Update lastResult juga biar konsisten
-        const lastResult = lastResultMap.get(tgId);
-        if (lastResult) lastResultMap.set(tgId, { ...lastResult, food_description: newDescription });
+        const lastResult = await db.getSession(tgId, 'last_result');
+        if (lastResult) {
+            await db.setSession(tgId, 'last_result', { ...lastResult, food_description: newDescription });
+        }
 
         await reply(ctx,
             `✅ *Deskripsi berhasil diupdate!*\n\n🍽️ *${newDescription}*`
@@ -987,8 +985,7 @@ async function handleAdjustInput(ctx, tgId, newDescription) {
  * Handle step-by-step edit angka nutrisi
  * State machine: ask_calories → ask_protein → ask_carbs → ask_fat → done
  */
-async function handleEditStep(ctx, tgId, body) {
-    const state = editModeMap.get(tgId);
+async function handleEditStep(ctx, tgId, body, state) {
     if (!state) return;
 
     const user = await db.getUser(tgId);
@@ -1001,7 +998,7 @@ async function handleEditStep(ctx, tgId, body) {
                 await reply(ctx, `Kalori harus angka 0-5000. Coba lagi!`);
                 return;
             }
-            editModeMap.set(tgId, { ...state, step: 'ask_protein', calories: val });
+            await db.setSession(tgId, 'edit_mode', { ...state, step: 'ask_protein', calories: val });
             await reply(ctx,
                 `🔥 Kalori: *${val} kkal* ✅\n\n` +
                 `*Protein berapa gram?*\n_(ketik angka baru, atau ketik sama kayak sebelumnya: ${state.protein_g}g)_`
@@ -1015,7 +1012,7 @@ async function handleEditStep(ctx, tgId, body) {
                 await reply(ctx, `Protein harus angka 0-500. Coba lagi!`);
                 return;
             }
-            editModeMap.set(tgId, { ...state, step: 'ask_carbs', protein_g: val });
+            await db.setSession(tgId, 'edit_mode', { ...state, step: 'ask_carbs', protein_g: val });
             await reply(ctx,
                 `💪 Protein: *${val}g* ✅\n\n` +
                 `*Karbohidrat berapa gram?*\n_(sebelumnya: ${state.carbs_g}g)_`
@@ -1029,7 +1026,7 @@ async function handleEditStep(ctx, tgId, body) {
                 await reply(ctx, `Karbo harus angka 0-1000. Coba lagi!`);
                 return;
             }
-            editModeMap.set(tgId, { ...state, step: 'ask_fat', carbs_g: val });
+            await db.setSession(tgId, 'edit_mode', { ...state, step: 'ask_fat', carbs_g: val });
             await reply(ctx,
                 `🍚 Karbo: *${val}g* ✅\n\n` +
                 `*Lemak berapa gram?*\n_(sebelumnya: ${state.fat_g}g)_`
@@ -1051,16 +1048,14 @@ async function handleEditStep(ctx, tgId, body) {
                 fat_g:     val
             };
 
-            editModeMap.delete(tgId);
+            await db.deleteSession(tgId, 'edit_mode');
 
             try {
                 await db.updateFoodLog(state.logId, tgId, updates);
 
-                // Update lastResult di memory biar /adjust selanjutnya dapet data terbaru
-                lastResultMap.set(tgId, {
-                    ...lastResultMap.get(tgId),
-                    ...updates
-                });
+                // Update lastResult di session biar /adjust selanjutnya dapet data terbaru
+                const prevResult = await db.getSession(tgId, 'last_result');
+                await db.setSession(tgId, 'last_result', { ...prevResult, ...updates });
 
                 // Hitung ulang progress hari ini
                 const summary   = await db.getDailySummary(tgId);
@@ -1165,9 +1160,9 @@ async function handleCallbackQuery(ctx) {
     if (data === 'confirm_reset') {
         try {
             const deleted = await db.deleteTodayLogs(tgId);
-            lastLogIdMap.delete(tgId);
-            lastResultMap.delete(tgId);
-            adjustModeMap.delete(tgId);
+            await db.deleteSession(tgId, 'last_log_id');
+            await db.deleteSession(tgId, 'last_result');
+            await db.deleteSession(tgId, 'adjust_mode');
             await ctx.editMessageText(
                 `✅ *Reset berhasil!* ${deleted} log dihapus. Fresh start! 💪`,
                 { parse_mode: 'Markdown' }
@@ -1185,19 +1180,19 @@ async function handleCallbackQuery(ctx) {
 
     // ── Edit deskripsi ───────────────────────────────────────
     if (data === 'edit_desc') {
-        const lastLogId = lastLogIdMap.get(tgId);
-        adjustModeMap.set(tgId, lastLogId);
+        const lastLogId = await db.getSession(tgId, 'last_log_id');
+        await db.setSession(tgId, 'adjust_mode', lastLogId);
         await ctx.editMessageText(`✏️ Ketik nama/deskripsi makanan yang bener:\n\n_Atau /batal untuk cancel_`, { parse_mode: 'Markdown' });
         return;
     }
 
     // ── Edit angka nutrisi ───────────────────────────────────
     if (data === 'edit_numbers') {
-        const lastLogId  = lastLogIdMap.get(tgId);
-        const lastResult = lastResultMap.get(tgId);
+        const lastLogId  = await db.getSession(tgId, 'last_log_id');
+        const lastResult = await db.getSession(tgId, 'last_result');
 
         // Set state edit dengan data saat ini sebagai default
-        editModeMap.set(tgId, {
+        await db.setSession(tgId, 'edit_mode', {
             step:             'ask_calories',
             logId:            lastLogId,
             food_description: lastResult?.food_description || '',
@@ -1217,8 +1212,8 @@ async function handleCallbackQuery(ctx) {
     }
 
     if (data === 'cancel_edit') {
-        adjustModeMap.delete(tgId);
-        editModeMap.delete(tgId);
+        await db.deleteSession(tgId, 'adjust_mode');
+        await db.deleteSession(tgId, 'edit_mode');
         await ctx.editMessageText(`Oke, log gak diubah! 👌`);
         return;
     }
@@ -1238,10 +1233,11 @@ async function handleCallbackQuery(ctx) {
         try {
             await db.deleteLogById(logId, tgId);
 
-            // Kalau yang dihapus adalah last log, clear memory
-            if (lastLogIdMap.get(tgId) === logId) {
-                lastLogIdMap.delete(tgId);
-                lastResultMap.delete(tgId);
+            // Kalau yang dihapus adalah last log, clear session
+            const currentLastLogId = await db.getSession(tgId, 'last_log_id');
+            if (currentLastLogId === logId) {
+                await db.deleteSession(tgId, 'last_log_id');
+                await db.deleteSession(tgId, 'last_result');
             }
 
             const summary   = await db.getDailySummary(tgId);
@@ -1265,13 +1261,13 @@ async function handleCallbackQuery(ctx) {
 
     // ── Pilih jenis foto: analisis makanan atau scan label gizi ──
     if (data === 'photo_mode_food') {
-        const photoData = photoChoiceMap.get(tgId);
+        const photoData = await db.getSession(tgId, 'photo_choice');
         if (!photoData) {
             await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
             return;
         }
-        photoChoiceMap.delete(tgId);
-        photoContextMap.set(tgId, { fileUrl: photoData.fileUrl });
+        await db.deleteSession(tgId, 'photo_choice');
+        await db.setSession(tgId, 'photo_context', { fileUrl: photoData.fileUrl });
 
         await ctx.editMessageText(
             `🍽️ *Analisis Makanan*\n\n` +
@@ -1291,12 +1287,12 @@ async function handleCallbackQuery(ctx) {
     }
 
     if (data === 'photo_mode_label') {
-        const photoData = photoChoiceMap.get(tgId);
+        const photoData = await db.getSession(tgId, 'photo_choice');
         if (!photoData) {
             await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
             return;
         }
-        photoChoiceMap.delete(tgId);
+        await db.deleteSession(tgId, 'photo_choice');
         await ctx.editMessageText(`🏷️ Oke, scan label nutrisi... 🔍`);
         await processLabelAnalysis(ctx, tgId, photoData.fileUrl);
         return;
@@ -1305,7 +1301,7 @@ async function handleCallbackQuery(ctx) {
     // ── Skip konteks foto — langsung analisis tanpa konteks ──
     if (data === 'photo_skip_context') {
         await ctx.answerCbQuery();
-        const photoData = photoContextMap.get(tgId);
+        const photoData = await db.getSession(tgId, 'photo_context');
         if (!photoData) {
             await ctx.editMessageText(`Foto udah expired. Kirim ulang ya! 📸`);
             return;
@@ -1317,7 +1313,7 @@ async function handleCallbackQuery(ctx) {
 
     // ── Pilihan porsi setelah scan label nutrisi ─────────────
     if (data === 'label_serving_1' || data === 'label_serving_all') {
-        const flow = labelFlowMap.get(tgId);
+        const flow = await db.getSession(tgId, 'label_flow');
         if (!flow) {
             await ctx.editMessageText(`Sesi scan-nya udah expired. Kirim ulang fotonya ya! 📸`);
             return;
@@ -1325,7 +1321,7 @@ async function handleCallbackQuery(ctx) {
 
         flow.multiplier = data === 'label_serving_all' ? flow.label.servings_per_package : 1;
         flow.stage      = 'awaiting_name';
-        labelFlowMap.set(tgId, flow);
+        await db.setSession(tgId, 'label_flow', flow);
 
         await ctx.editMessageText(
             `Oke, ${flow.multiplier}x sajian ya! ✅\n\n` +
@@ -1385,13 +1381,13 @@ async function handleCallbackQuery(ctx) {
     // ── Simpan ke menu (setelah analisis foto) ───────────────
     if (data === 'save_to_menu') {
         // Clear semua mode lain dulu biar gak ada konflik
-        // Ini root cause bug: inputModeMap yang masih ke-set dari /input sebelumnya
-        // bikin teks nama menu salah masuk ke handleInputStep
-        inputModeMap.delete(tgId);
-        editModeMap.delete(tgId);
-        adjustModeMap.delete(tgId);
+        // (dulu ini root cause bug: inputModeMap yang masih ke-set dari
+        // /input sebelumnya bikin teks nama menu salah masuk ke handleInputStep)
+        await db.deleteSession(tgId, 'input_mode');
+        await db.deleteSession(tgId, 'edit_mode');
+        await db.deleteSession(tgId, 'adjust_mode');
 
-        saveMenuModeMap.set(tgId, true);
+        await db.setSession(tgId, 'save_menu_mode', true);
         await ctx.editMessageText(
             ctx.callbackQuery.message.text + '\n\n✏️ _Ketik nama untuk menu ini:_',
             { parse_mode: 'Markdown' }
@@ -1539,23 +1535,17 @@ async function handlePhoto(ctx) {
         return;
     }
 
-    // Clear semua mode yang aktif
-    adjustModeMap.delete(tgId);
-    saveMenuModeMap.delete(tgId);
-    inputModeMap.delete(tgId);
-    editModeMap.delete(tgId);
-    photoContextMap.delete(tgId);
-    labelFlowMap.delete(tgId);
-    photoChoiceMap.delete(tgId);
+    // Clear semua mode yang aktif (last_log_id/last_result TETAP disimpen)
+    await db.clearModeSessions(tgId);
 
     try {
-        // Ambil file info foto dulu — simpan ke memory, tunggu user pilih mode analisis
+        // Ambil file info foto dulu — simpan session, tunggu user pilih mode analisis
         const photos    = ctx.message.photo;
         const bestPhoto = photos[photos.length - 1];
         const fileInfo  = await ctx.telegram.getFile(bestPhoto.file_id);
         const fileUrl   = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
-        photoChoiceMap.set(tgId, { fileUrl });
+        await db.setSession(tgId, 'photo_choice', { fileUrl });
 
         // Tanya dulu ini foto apa — makanan biasa atau label nutrisi
         await ctx.reply(
@@ -1579,10 +1569,10 @@ async function handlePhoto(ctx) {
 
 /**
  * Handle konteks teks yang dikirim user setelah foto
- * Dipanggil dari handleText waktu photoContextMap aktif
+ * Dipanggil dari handleText waktu session 'photo_context' aktif
+ * @param {object} photoData - hasil db.getSession(tgId, 'photo_context'), sudah di-fetch di handleText
  */
-async function handlePhotoContext(ctx, tgId, context) {
-    const photoData = photoContextMap.get(tgId);
+async function handlePhotoContext(ctx, tgId, context, photoData) {
     if (!photoData) return;
 
     // Langsung proses dengan konteks yang diberikan
@@ -1595,7 +1585,7 @@ async function handlePhotoContext(ctx, tgId, context) {
  */
 async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
     const user = await db.getUser(tgId);
-    photoContextMap.delete(tgId); // hapus dari memory
+    await db.deleteSession(tgId, 'photo_context'); // hapus session, gak dipake lagi
 
     // Loading message TANPA keyboard — biar bisa di-edit
     const loadingMsg = await ctx.reply(
@@ -1629,9 +1619,9 @@ async function processPhotoAnalysis(ctx, tgId, fileUrl, userContext = '') {
             gemini_raw: result.gemini_raw
         });
 
-        // Simpan ke memory buat /adjust dan save menu
-        lastLogIdMap.set(tgId, savedLog.id);
-        lastResultMap.set(tgId, result); // simpan full result buat fitur save menu
+        // Simpan ke session (DB) buat /adjust dan save menu
+        await db.setSession(tgId, 'last_log_id', savedLog.id);
+        await db.setSession(tgId, 'last_result', result); // simpan full result buat fitur save menu
 
         const summary                = await db.getDailySummary(tgId);
         const { bar, text: progTxt } = buildProgressSection(summary, user);
@@ -1726,9 +1716,9 @@ async function processLabelAnalysis(ctx, tgId, fileUrl) {
             return;
         }
 
-        // Simpan hasil ekstraksi ke memory, tunggu step berikutnya
+        // Simpan hasil ekstraksi ke session (DB), tunggu step berikutnya
         const needsServingChoice = label.servings_per_package > 1;
-        labelFlowMap.set(tgId, {
+        await db.setSession(tgId, 'label_flow', {
             stage: needsServingChoice ? 'awaiting_serving' : 'awaiting_name',
             label,
             multiplier: 1
@@ -1773,7 +1763,7 @@ async function processLabelAnalysis(ctx, tgId, fileUrl) {
 
     } catch (err) {
         console.error(`[LabelScanHandler] Error for ${tgId}:`, err.message);
-        labelFlowMap.delete(tgId);
+        await db.deleteSession(tgId, 'label_flow');
         const errMsg = {
             'RATE_LIMIT':   `⏳ Gemini overload. Tunggu ~1 menit ya!`,
             'SAFETY_BLOCK': `🚫 Gambar gak bisa diproses.`,
@@ -1788,7 +1778,7 @@ async function processLabelAnalysis(ctx, tgId, fileUrl) {
 
 /**
  * Handle input nama makanan setelah label diekstrak
- * Dipanggil dari handleText waktu labelFlowMap.stage === 'awaiting_name'
+ * Dipanggil dari handleText waktu session 'label_flow'.stage === 'awaiting_name'
  * Di sinilah log akhirnya kesimpen ke database.
  */
 async function handleLabelNameInput(ctx, tgId, foodName, flow) {
@@ -1801,7 +1791,7 @@ async function handleLabelNameInput(ctx, tgId, foodName, flow) {
         return;
     }
 
-    labelFlowMap.delete(tgId);
+    await db.deleteSession(tgId, 'label_flow');
 
     const user = await db.getUser(tgId);
     const { label, multiplier } = flow;
@@ -1823,12 +1813,12 @@ async function handleLabelNameInput(ctx, tgId, foodName, flow) {
             gemini_raw: label.gemini_raw || null
         });
 
-        lastLogIdMap.set(tgId, savedLog.id);
+        await db.setSession(tgId, 'last_log_id', savedLog.id);
         const fakeResult = {
             food_description, calories, protein_g, carbs_g, fat_g,
             data_source: 'nutrition_label'
         };
-        lastResultMap.set(tgId, fakeResult);
+        await db.setSession(tgId, 'last_result', fakeResult);
 
         const summary                = await db.getDailySummary(tgId);
         const { bar, text: progTxt } = buildProgressSection(summary, user);
@@ -1888,7 +1878,7 @@ async function handleInput(ctx) {
     }
 
     // Mulai state machine tanya satu-satu
-    inputModeMap.set(tgId, { step: 'ask_name' });
+    await db.setSession(tgId, 'input_mode', { step: 'ask_name' });
 
     await reply(ctx,
         `📝 *Input Nutrisi Manual*\n\n` +
@@ -1912,7 +1902,7 @@ async function handleInputTemplate(ctx, tgId, text, user) {
 
     if (parts.length < 2) {
         // Gak ada separator — anggap user cuma mau mulai step-by-step dengan nama
-        inputModeMap.set(tgId, { step: 'ask_calories', name: text });
+        await db.setSession(tgId, 'input_mode', { step: 'ask_calories', name: text });
         await reply(ctx,
             `Oke, *"${text}"* ✅\n\n` +
             `*Kalorinya berapa? (kkal)*\n_(contoh: 450 — atau ketik 0 kalau gak tau)_`
@@ -1956,8 +1946,8 @@ async function handleInputTemplate(ctx, tgId, text, user) {
             calories, protein_g, carbs_g, fat_g
         });
 
-        lastLogIdMap.set(tgId, savedLog.id);
-        lastResultMap.set(tgId, { food_description: name, calories, protein_g, carbs_g, fat_g });
+        await db.setSession(tgId, 'last_log_id', savedLog.id);
+        await db.setSession(tgId, 'last_result', { food_description: name, calories, protein_g, carbs_g, fat_g });
 
         const summary                = await db.getDailySummary(tgId);
         const { bar, text: progTxt } = buildProgressSection(summary, user);
@@ -1995,8 +1985,7 @@ async function handleInputTemplate(ctx, tgId, text, user) {
  * Handle setiap step input manual — dipanggil dari handleText
  * State machine: ask_name → ask_calories → ask_protein → ask_carbs → ask_fat → done
  */
-async function handleInputStep(ctx, tgId, body) {
-    const state = inputModeMap.get(tgId);
+async function handleInputStep(ctx, tgId, body, state) {
     if (!state) return;
 
     const user = await db.getUser(tgId);
@@ -2009,7 +1998,7 @@ async function handleInputStep(ctx, tgId, body) {
                 return;
             }
             // Simpan nama, lanjut ke step kalori
-            inputModeMap.set(tgId, { ...state, step: 'ask_calories', name: body });
+            await db.setSession(tgId, 'input_mode', { ...state, step: 'ask_calories', name: body });
             await reply(ctx,
                 `Oke, *"${body}"* ✅\n\n` +
                 `*Kalorinya berapa? (kkal)*\n` +
@@ -2025,7 +2014,7 @@ async function handleInputStep(ctx, tgId, body) {
                 await reply(ctx, `Kalori harus angka 0-5000. Coba lagi!`);
                 return;
             }
-            inputModeMap.set(tgId, { ...state, step: 'ask_protein', calories });
+            await db.setSession(tgId, 'input_mode', { ...state, step: 'ask_protein', calories });
             await reply(ctx,
                 `*Protein berapa gram?*\n` +
                 `_(contoh: 25.5)_\n` +
@@ -2040,7 +2029,7 @@ async function handleInputStep(ctx, tgId, body) {
                 await reply(ctx, `Protein harus angka 0-500 gram. Coba lagi!`);
                 return;
             }
-            inputModeMap.set(tgId, { ...state, step: 'ask_carbs', protein_g: protein });
+            await db.setSession(tgId, 'input_mode', { ...state, step: 'ask_carbs', protein_g: protein });
             await reply(ctx,
                 `*Karbohidrat berapa gram?*\n` +
                 `_(contoh: 60)_\n` +
@@ -2055,7 +2044,7 @@ async function handleInputStep(ctx, tgId, body) {
                 await reply(ctx, `Karbo harus angka 0-1000 gram. Coba lagi!`);
                 return;
             }
-            inputModeMap.set(tgId, { ...state, step: 'ask_fat', carbs_g: carbs });
+            await db.setSession(tgId, 'input_mode', { ...state, step: 'ask_fat', carbs_g: carbs });
             await reply(ctx,
                 `*Lemak berapa gram?*\n` +
                 `_(contoh: 15)_\n` +
@@ -2080,15 +2069,15 @@ async function handleInputStep(ctx, tgId, body) {
                 fat_g:            fat
             };
 
-            // Hapus dari state map dulu sebelum DB call
-            inputModeMap.delete(tgId);
+            // Hapus session dulu sebelum DB call
+            await db.deleteSession(tgId, 'input_mode');
 
             try {
                 const savedLog = await db.insertFoodLog(tgId, finalData);
 
-                // Simpan ke memory buat /adjust dan save menu
-                lastLogIdMap.set(tgId, savedLog.id);
-                lastResultMap.set(tgId, finalData);
+                // Simpan ke session (DB) buat /adjust dan save menu
+                await db.setSession(tgId, 'last_log_id', savedLog.id);
+                await db.setSession(tgId, 'last_result', finalData);
 
                 // Hitung progress hari ini
                 const summary                = await db.getDailySummary(tgId);
@@ -2324,22 +2313,15 @@ function buildStatusMessage(summary, dailyGoal, foodList = []) {
 }
 
 /**
- * Reset semua in-memory state harian
+ * Reset semua in-memory state harian + session DB (semua flow: log
+ * terakhir, adjust, edit, input manual, save-menu, foto/label)
  * Dipanggil tiap tengah malam oleh cron job
  * Biar /adjust gak nyasar ke log kemarin
  */
-function resetDailyMemory() {
-    lastLogIdMap.clear();
-    lastResultMap.clear();
-    adjustModeMap.clear();
-    editModeMap.clear();
-    saveMenuModeMap.clear();
-    inputModeMap.clear();
-    photoContextMap.clear();
-    coachHistoryMap.clear();
-    photoChoiceMap.clear();
-    labelFlowMap.clear();
-    console.log('[Memory] Daily reset — semua state map cleared');
+async function resetDailyMemory() {
+    coachHistoryMap.clear(); // history /tanya — masih in-memory, gak kritikal
+    await db.clearAllSessionsGlobal(); // hapus SEMUA session (last_log_id, last_result, adjust_mode, edit_mode, save_menu_mode, input_mode, photo_choice, photo_context, label_flow) — semua user
+    console.log('[Memory] Daily reset — semua state & session cleared');
 }
 
 module.exports = {

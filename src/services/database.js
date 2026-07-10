@@ -391,6 +391,115 @@ async function deleteMenu(menuId, telegramId) {
     }
 }
 
+// ─── SESSION STATE (persistent, serverless-safe) ──────────────
+// NEW — ganti in-memory Map() buat state percakapan multi-step
+// (foto → pilih mode → input lanjutan). Vercel serverless bisa
+// nge-spin instance baru tiap request, jadi Map() biasa gak
+// reliable buat nyimpen state antar-request. Disimpen di sini aja.
+
+/**
+ * Ambil session state tersimpan
+ * @param {number} telegramId
+ * @param {string} key - 'photo_choice' | 'photo_context' | 'label_flow'
+ * @returns {object|null}
+ */
+async function getSession(telegramId, key) {
+    const { data, error } = await supabase
+        .from('bot_sessions')
+        .select('session_data')
+        .eq('telegram_id', telegramId)
+        .eq('session_key', key)
+        .single();
+
+    if (error && error.code !== 'PGRST116') {
+        console.error(`[DB] getSession(${key}) error:`, error.message);
+    }
+    return data ? data.session_data : null;
+}
+
+/**
+ * Simpan/update session state
+ * @param {number} telegramId
+ * @param {string} key
+ * @param {object} value
+ */
+async function setSession(telegramId, key, value) {
+    const { error } = await supabase
+        .from('bot_sessions')
+        .upsert(
+            {
+                telegram_id:  telegramId,
+                session_key:  key,
+                session_data: value,
+                updated_at:   new Date().toISOString()
+            },
+            { onConflict: 'telegram_id,session_key' }
+        );
+
+    if (error) console.error(`[DB] setSession(${key}) error:`, error.message);
+}
+
+/**
+ * Hapus 1 session state spesifik
+ * @param {number} telegramId
+ * @param {string} key
+ */
+async function deleteSession(telegramId, key) {
+    const { error } = await supabase
+        .from('bot_sessions')
+        .delete()
+        .eq('telegram_id', telegramId)
+        .eq('session_key', key);
+
+    if (error) console.error(`[DB] deleteSession(${key}) error:`, error.message);
+}
+
+/**
+ * Hapus semua session state milik 1 user (dipake buat /batal)
+ * @param {number} telegramId
+ */
+async function deleteAllSessions(telegramId) {
+    const { error } = await supabase
+        .from('bot_sessions')
+        .delete()
+        .eq('telegram_id', telegramId);
+
+    if (error) console.error('[DB] deleteAllSessions error:', error.message);
+}
+
+/**
+ * Hapus HANYA session "mode aktif" (input/edit/adjust/savemenu/foto),
+ * TAPI simpen 'last_log_id' & 'last_result' — biar /adjust masih bisa
+ * nunjuk ke log terakhir yang beneran udah kesimpen walaupun user lagi
+ * mulai mode baru (kirim foto baru / /catat baru / /batal).
+ * @param {number} telegramId
+ */
+async function clearModeSessions(telegramId) {
+    const modeKeys = [
+        'photo_choice', 'photo_context', 'label_flow',
+        'input_mode', 'edit_mode', 'save_menu_mode', 'adjust_mode'
+    ];
+    const { error } = await supabase
+        .from('bot_sessions')
+        .delete()
+        .eq('telegram_id', telegramId)
+        .in('session_key', modeKeys);
+
+    if (error) console.error('[DB] clearModeSessions error:', error.message);
+}
+
+/**
+ * Hapus semua session state utk SEMUA user (dipake buat auto-reset tengah malam)
+ */
+async function clearAllSessionsGlobal() {
+    const { error } = await supabase
+        .from('bot_sessions')
+        .delete()
+        .neq('telegram_id', 0); // trik biar delete semua row (Supabase wajib ada filter)
+
+    if (error) console.error('[DB] clearAllSessionsGlobal error:', error.message);
+}
+
 module.exports = {
     // user
     getUser, upsertUser, updateRegistrationStep,
@@ -402,5 +511,7 @@ module.exports = {
     getDailySummary, getTodayFoodList, getWeeklyLogs,
     // saved menus
     saveMenu, getSavedMenus, getSavedMenuById,
-    incrementMenuUseCount, deleteMenu
+    incrementMenuUseCount, deleteMenu,
+    // session state (NEW — persistent, serverless-safe)
+    getSession, setSession, deleteSession, deleteAllSessions, clearModeSessions, clearAllSessionsGlobal
 };

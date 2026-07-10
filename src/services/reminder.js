@@ -64,11 +64,11 @@ function initReminder(bot) {
     // 00:00 WIB = 17:00 UTC
     // Data DB gak perlu dihapus — getTodayWIB() otomatis baca tanggal baru
     // Yang direset cuma in-memory Maps biar /adjust gak nyasar ke log kemarin
-    cron.schedule('0 17 * * *', () => {
+    cron.schedule('0 17 * * *', async () => {
         try {
             // Import di sini buat avoid circular dependency
             const { resetDailyMemory } = require('../handlers/messageHandler');
-            resetDailyMemory();
+            await resetDailyMemory();
             console.log('[MidnightReset] 00:00 WIB — memory reset done ✅');
         } catch (err) {
             console.error('[MidnightReset] Error:', err.message);

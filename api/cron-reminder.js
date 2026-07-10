@@ -29,7 +29,7 @@ module.exports = async (req, res) => {
         if (hours === '00' && minutes === '00') {
             try {
                 const { resetDailyMemory } = require('../src/handlers/messageHandler');
-                resetDailyMemory();
+                await resetDailyMemory();
                 console.log('[MidnightReset] 00:00 WIB — memory reset done ✅');
             } catch (err) {
                 console.error('[MidnightReset] Error:', err.message);
