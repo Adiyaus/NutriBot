@@ -476,7 +476,7 @@ async function deleteAllSessions(telegramId) {
  */
 async function clearModeSessions(telegramId) {
     const modeKeys = [
-        'photo_choice', 'photo_context', 'label_flow',
+        'photo_choice', 'photo_context', 'label_flow', 'pending_confirm',
         'input_mode', 'edit_mode', 'save_menu_mode', 'adjust_mode'
     ];
     const { error } = await supabase
